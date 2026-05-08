@@ -1,4 +1,4 @@
-<img width="762" height="812" alt="Screenshot 2026-05-08 231941" src="https://github.com/user-attachments/assets/170952d3-d68f-4485-98f5-f849fa4ed9c6" />
+<img width="762" height="812" alt="Screenshot 2026-05-09 000829" src="https://github.com/user-attachments/assets/9c6ab511-a427-4afa-b26e-496557233ac4" />
 
 ## Main functions of the ZSend Wallet:
 * Create T-addresses (transparent) and Z-addresses (private)
