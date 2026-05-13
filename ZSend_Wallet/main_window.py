@@ -6,7 +6,7 @@ from secrets import token_hex
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QLocale, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -53,6 +53,24 @@ from . import address_actions, send_flow, shutdown_flow
 MIN_NODE_FEE_BTCZ = 0.00001
 MAX_NODE_FEE_BTCZ = 0.1
 MAX_BTCZ_MONEY = 21_000_000_000
+
+
+class BtcZAmountSpinBox(QDoubleSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setLocale(QLocale.c())
+
+    def textFromValue(self, value: float) -> str:
+        return fmt_btcz(value)
+
+    def valueFromText(self, text: str) -> float:
+        raw = str(text or "").replace("BTCZ", "").replace(",", ".").strip()
+        if not raw:
+            return 0.0
+        try:
+            return float(raw.split()[0])
+        except (TypeError, ValueError, IndexError):
+            return 0.0
 
 
 class MainWindow(QMainWindow):
@@ -359,7 +377,7 @@ class MainWindow(QMainWindow):
 
         v.addWidget(slbl(tr("dialogs.main_window.amount")))
         amt_row = QHBoxLayout(); amt_row.setSpacing(6)
-        self.spin_amt = QDoubleSpinBox()
+        self.spin_amt = BtcZAmountSpinBox()
         self.spin_amt.setDecimals(8); self.spin_amt.setMaximum(MAX_BTCZ_MONEY)
         self.spin_amt.setMinimum(0); self.spin_amt.setValue(0)
         self.spin_amt.setSpecialValueText("0")
@@ -380,7 +398,7 @@ class MainWindow(QMainWindow):
         amt_row.addWidget(self.btn_max); v.addLayout(amt_row)
 
         v.addWidget(slbl(tr("dialogs.main_window.network_fee")))
-        self.spin_fee = QDoubleSpinBox()
+        self.spin_fee = BtcZAmountSpinBox()
         self.spin_fee.setDecimals(8); self.spin_fee.setMaximum(MAX_NODE_FEE_BTCZ)
         self.spin_fee.setMinimum(MIN_NODE_FEE_BTCZ); self.spin_fee.setValue(MIN_NODE_FEE_BTCZ)
         self.spin_fee.setSingleStep(0.000005)

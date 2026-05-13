@@ -308,7 +308,7 @@ def package_release(exe_path: Path, identity: dict[str, str], _node_metadata: di
     _copy_tree(LICENSE_DIR, package_root / "license")
 
     RELEASE_DIR.mkdir(exist_ok=True)
-    zip_path = RELEASE_DIR / f"{package_name}.zip"
+    zip_path = RELEASE_DIR / f"{package_name}-win.zip"
     _zip_dir(package_root, zip_path)
     return zip_path
 
