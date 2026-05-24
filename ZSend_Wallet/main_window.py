@@ -42,7 +42,7 @@ from .rpc import BitcoinZRPC, RPCError
 from .wallet_cache import WalletCache, btcz_to_zat, zat_to_float
 from .wallet_export import _sanitize_dump_basename, FullWalletExportWorker
 from .wallet_import import FullWalletImportWorker, read_recent_wallet_rescan_state
-from .workers import NewAddressWorker, PollWorker, RefreshWorker, SendWorker, ShutdownWorker
+from .workers import NewAddressWorker, PollWorker, RefreshWorker, SendWorker, ShutdownWorker, StatusWorker
 from .dialogs import AboutDialog, BusyDialog, ConfigDialog, DiagDialog, ImportKeyDialog, KeyDisplayDialog, TxDetailDialog, _DraggableDialog, _ask_yes_no, _get_open_file_name, _get_save_file_name, _msg, _msg_critical, _msg_info
 from .helpers import _fmt_addr, _sort_addr_items, fmt_btcz, fmt_ts
 from .locales import tr
@@ -98,6 +98,8 @@ class MainWindow(QMainWindow):
         self._addr_balances: dict   = {}
         self._max_mode: bool        = False
         self._refresh_running: bool = False
+        self._status_refresh_running: bool = False
+        self._status_rpc_failures: int = 0
         self._had_balance: bool     = False
         self._tx_cache_key: str     = ""
         self._threads: list         = []
@@ -125,10 +127,14 @@ class MainWindow(QMainWindow):
 
         self._timer = QTimer(self); self._timer.timeout.connect(self.refresh)
         self._timer.start(30_000)
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self.refresh_status)
+        self._status_timer.start(2_000)
         self._reconcile_timer = QTimer(self)
         self._reconcile_timer.timeout.connect(lambda: self.refresh(force_full=True))
         self._reconcile_timer.start(300_000)
         self.refresh()
+        self.refresh_status()
 
     def _bring_to_front(self):
         self.setWindowState(Qt.WindowState.WindowActive)
@@ -136,6 +142,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._timer.stop()
+        if hasattr(self, "_status_timer"):
+            self._status_timer.stop()
         if hasattr(self, "_reconcile_timer"):
             self._reconcile_timer.stop()
         for w in list(_RUNNING_WORKERS):
@@ -1198,6 +1206,67 @@ class MainWindow(QMainWindow):
     def _manual_refresh(self, *_):
         self.refresh(force_full=True)
 
+    def refresh_status(self):
+        if self._status_refresh_running:
+            return
+        self._status_refresh_running = True
+        w = StatusWorker(self.rpc)
+        self._threads.append(w)
+        w.finished.connect(lambda: self._threads.remove(w) if w in self._threads else None)
+        w.done.connect(self._on_status_done)
+        w.error.connect(self._on_status_err)
+        _track(w).start()
+
+    def _on_status_done(self, data: dict):
+        self._status_refresh_running = False
+        self._status_rpc_failures = 0
+        chain = data.get("chain", {}) if isinstance(data, dict) else {}
+        blocks = chain.get("blocks", "-")
+        peers = data.get("peers", "-") if isinstance(data, dict) else "-"
+        try:
+            self._cur_blocks = int(blocks)
+        except Exception:
+            pass
+        self.lbl_blocks.setText(tr("dialogs.main_window.blocks", value=blocks))
+        self.lbl_peers.setText(tr("dialogs.main_window.peers", value=peers))
+
+        if self._rescan_status_active:
+            return
+
+        vp = chain.get("verificationprogress")
+        if vp is None:
+            self._set_status_visual("connected", "  " + tr("dialogs.main_window.connected"))
+            self._set_sync_visual("idle", value=0, text="-")
+            return
+        try:
+            pct = max(0.0, min(100.0, float(vp) * 100))
+        except Exception:
+            pct = 0.0
+        syncing = bool(chain.get("initialblockdownload") or chain.get("reindex")) or pct < 99.9
+        self._set_status_visual(
+            "syncing" if syncing else "connected",
+            "  " + (tr("dialogs.main_window.synchronizing") if syncing else tr("dialogs.main_window.connected")),
+        )
+        self._set_sync_visual(
+            "syncing" if syncing else "synced",
+            value=int(pct * 100),
+            text=tr("dialogs.main_window.synchronization", percent=pct)
+            if syncing else f"{tr('dialogs.main_window.connected')}  {pct:.2f}%",
+        )
+
+    def _on_status_err(self, msg: str):
+        self._status_refresh_running = False
+        self._status_rpc_failures += 1
+        if self._status_rpc_failures < 3:
+            return
+        if self._data:
+            last_sync = fmt_ts(self._last_sync_ts) if self._last_sync_ts else "-"
+            self._set_status_visual("offline", "  " + tr("dialogs.main_window.offline_cached"))
+            self._set_sync_visual("offline", value=0, text=tr("dialogs.main_window.offline_last_sync", value=last_sync))
+        else:
+            self._set_status_visual("offline", "  " + tr("dialogs.main_window.not_connected"))
+            self._set_sync_visual("offline", value=0, text=tr("dialogs.main_window.not_connected"))
+
     def refresh(self, force_full: bool = False):
         if self._refresh_running: return
         self._refresh_running = True
@@ -1213,6 +1282,7 @@ class MainWindow(QMainWindow):
 
     def _on_done(self, data: dict):
         self._refresh_running = False
+        self._status_rpc_failures = 0
         self._apply_wallet_data(data, cached=False)
         self._run_reconciliation(data)
         self._update_wallet_key_actions()

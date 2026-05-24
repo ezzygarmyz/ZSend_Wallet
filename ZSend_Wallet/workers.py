@@ -707,6 +707,38 @@ class RefreshWorker(QThread):
             self.error.emit(msg)
 
 
+class StatusWorker(QThread):
+    done = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, rpc: BitcoinZRPC):
+        super().__init__()
+        self.host = rpc.host
+        self.port = rpc.port
+        self.user = rpc.user
+        self.password = rpc.password
+
+    def run(self):
+        try:
+            rpc = BitcoinZRPC(self.host, self.port, self.user, self.password)
+            chain = rpc.getBlockchainInfo() or {}
+            peers = "-"
+            try:
+                net = rpc.getNetworkInfo()
+                if isinstance(net, dict):
+                    peers = net.get("connections", peers)
+            except Exception:
+                try:
+                    peers = rpc.getConnectionCount()
+                except Exception:
+                    pass
+            self.done.emit({"chain": chain, "peers": peers})
+        except RPCError as e:
+            self.error.emit(str(e))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class PollWorker(QThread):
     status_update = Signal(str)
     success       = Signal(str)
