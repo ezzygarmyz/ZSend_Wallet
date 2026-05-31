@@ -708,15 +708,79 @@ class RefreshWorker(QThread):
 
 
 class StatusWorker(QThread):
+    _TX_PROBE_LIMIT = 40
     done = Signal(object)
     error = Signal(str)
 
-    def __init__(self, rpc: BitcoinZRPC):
+    def __init__(self, rpc: BitcoinZRPC, txids: list[str] | tuple[str, ...] | None = None):
         super().__init__()
         self.host = rpc.host
         self.port = rpc.port
         self.user = rpc.user
         self.password = rpc.password
+        seen: set[str] = set()
+        self.txids: list[str] = []
+        for txid in txids or []:
+            txid = str(txid or "").strip()
+            if not txid or txid in seen:
+                continue
+            seen.add(txid)
+            self.txids.append(txid)
+            if len(self.txids) >= self._TX_PROBE_LIMIT:
+                break
+
+    @staticmethod
+    def _status_from_confirmations(confirmations: int) -> str:
+        if confirmations < 0:
+            return "conflicted"
+        if confirmations == 0:
+            return "pending"
+        return "confirmed"
+
+    def _probe_transaction(self, rpc: BitcoinZRPC, txid: str) -> dict | None:
+        source: dict = {}
+        full: dict = {}
+        raw: dict = {}
+        try:
+            full = rpc.getTransaction(txid) or {}
+            if isinstance(full, dict):
+                source.update(full)
+        except Exception:
+            pass
+        if not source or not source.get("blockhash") or source.get("height") is None:
+            try:
+                raw = rpc.getRawTransaction(txid) or {}
+                if isinstance(raw, dict):
+                    for key, value in raw.items():
+                        source.setdefault(key, value)
+            except Exception:
+                pass
+        if not source:
+            return None
+        try:
+            confirmations = int(source.get("confirmations", 0) or 0)
+        except Exception:
+            confirmations = 0
+        update = {
+            "txid": txid,
+            "confirmations": confirmations,
+            "status": self._status_from_confirmations(confirmations),
+        }
+        field_map = {
+            "blockhash": "blockhash",
+            "height": "blockheight",
+            "blockheight": "blockheight",
+            "blockindex": "blockindex",
+            "time": "time",
+            "blocktime": "blocktime",
+            "timereceived": "timereceived",
+            "fee": "fee",
+        }
+        for source_key, target_key in field_map.items():
+            value = source.get(source_key)
+            if value not in (None, ""):
+                update[target_key] = value
+        return update
 
     def run(self):
         try:
@@ -732,7 +796,12 @@ class StatusWorker(QThread):
                     peers = rpc.getConnectionCount()
                 except Exception:
                     pass
-            self.done.emit({"chain": chain, "peers": peers})
+            tx_updates = []
+            for txid in self.txids:
+                update = self._probe_transaction(rpc, txid)
+                if update:
+                    tx_updates.append(update)
+            self.done.emit({"chain": chain, "peers": peers, "tx_updates": tx_updates})
         except RPCError as e:
             self.error.emit(str(e))
         except Exception as e:

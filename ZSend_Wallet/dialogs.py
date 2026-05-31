@@ -966,6 +966,65 @@ class TxDetailsWorker(QThread):
         return prevouts
 
 
+class TxStatusWorker(QThread):
+    done = Signal(dict)
+
+    def __init__(self, rpc: BitcoinZRPC, txid: str):
+        super().__init__()
+        self.rpc = rpc
+        self.txid = txid
+
+    @staticmethod
+    def _status_from_confirmations(confirmations: int) -> str:
+        if confirmations < 0:
+            return "conflicted"
+        if confirmations == 0:
+            return "pending"
+        return "confirmed"
+
+    def run(self):
+        payload = {"chain_height": 0, "tx": {}}
+        try:
+            chain = self.rpc.getBlockchainInfo() or {}
+            payload["chain_height"] = int(chain.get("blocks", 0) or 0)
+        except Exception:
+            pass
+        source = {}
+        try:
+            source = self.rpc.getTransaction(self.txid) or {}
+        except Exception:
+            try:
+                source = self.rpc.getRawTransaction(self.txid) or {}
+            except Exception:
+                source = {}
+        if isinstance(source, dict) and source:
+            try:
+                confirmations = int(source.get("confirmations", 0) or 0)
+            except Exception:
+                confirmations = 0
+            tx = {
+                "txid": self.txid,
+                "confirmations": confirmations,
+                "status": self._status_from_confirmations(confirmations),
+            }
+            field_map = {
+                "blockhash": "blockhash",
+                "height": "blockheight",
+                "blockheight": "blockheight",
+                "blockindex": "blockindex",
+                "time": "time",
+                "blocktime": "blocktime",
+                "timereceived": "timereceived",
+                "fee": "fee",
+            }
+            for source_key, target_key in field_map.items():
+                value = source.get(source_key)
+                if value not in (None, ""):
+                    tx[target_key] = value
+            payload["tx"] = tx
+        self.done.emit(payload)
+
+
 class TxDetailDialog(_DraggableDialog):
     _T_P2PKH_PREFIX = bytes.fromhex("1cb8")
     _BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -981,6 +1040,7 @@ class TxDetailDialog(_DraggableDialog):
         self._confirms = 0
         self._payload = {"full": {}, "raw": {}}
         self._detail_worker = None
+        self._status_worker = None
         self._live_refresh_failed = False
         self._dynamic_rows: dict[str, QLabel] = {}
         self._layout_signature = None
@@ -991,13 +1051,16 @@ class TxDetailDialog(_DraggableDialog):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._auto_refresh)
-        self._timer.start(30_000)
+        self._timer.start(2_000)
 
     def _auto_refresh(self):
-        if self._confirms >= 6:
+        if self._confirms >= 6 and tx_status_code(self._current_detail_tx()) == "confirmed":
             self._timer.stop()
             return
-        self._request_refresh()
+        if self._layout_signature is None or self._live_refresh_failed:
+            self._request_refresh()
+        else:
+            self._request_status_refresh()
 
     def closeEvent(self, event):
         self._timer.stop()
@@ -1007,6 +1070,12 @@ class TxDetailDialog(_DraggableDialog):
             except Exception:
                 pass
             self._detail_worker = None
+        if self._status_worker is not None:
+            try:
+                self._status_worker.done.disconnect(self._on_status_payload_ready)
+            except Exception:
+                pass
+            self._status_worker = None
         super().closeEvent(event)
 
     def _request_refresh(self):
@@ -1019,6 +1088,14 @@ class TxDetailDialog(_DraggableDialog):
         self._detail_worker.done.connect(self._on_payload_ready)
         self._detail_worker.finished.connect(self._detail_worker.deleteLater)
         _track(self._detail_worker).start()
+
+    def _request_status_refresh(self):
+        if self._status_worker is not None or self._detail_worker is not None:
+            return
+        self._status_worker = TxStatusWorker(self._rpc, self._txid)
+        self._status_worker.done.connect(self._on_status_payload_ready)
+        self._status_worker.finished.connect(self._status_worker.deleteLater)
+        _track(self._status_worker).start()
 
     def _on_payload_ready(self, payload: dict):
         self._payload = payload or {"full": {}, "raw": {}}
@@ -1034,6 +1111,53 @@ class TxDetailDialog(_DraggableDialog):
             self._update_dynamic_rows()
         else:
             self._load()
+
+    def _merge_live_tx_update(self, update: dict) -> bool:
+        changed = False
+        if not update:
+            return changed
+        targets = [self._tx]
+        full_payload = self._payload.get("full")
+        if isinstance(full_payload, dict) and full_payload:
+            targets.append(full_payload)
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            for field in (
+                "confirmations", "status", "blockhash", "blockheight", "blockindex",
+                "time", "blocktime", "timereceived", "fee",
+            ):
+                if field not in update:
+                    continue
+                value = update.get(field)
+                if value in (None, ""):
+                    continue
+                if field in {"confirmations", "blockheight", "blockindex", "time", "blocktime", "timereceived"}:
+                    try:
+                        value = int(value)
+                    except Exception:
+                        pass
+                if target.get(field) != value:
+                    target[field] = value
+                    changed = True
+        return changed
+
+    def _on_status_payload_ready(self, payload: dict):
+        payload = payload or {}
+        self._status_worker = None
+        if payload.get("chain_height"):
+            self._payload["chain_height"] = payload.get("chain_height")
+        update = payload.get("tx") or {}
+        if not update:
+            self._update_dynamic_rows()
+            return
+        old_signature = self._layout_signature
+        self._merge_live_tx_update(update)
+        new_signature = self._make_layout_signature(self._payload)
+        if old_signature is not None and new_signature == old_signature:
+            self._update_dynamic_rows()
+        else:
+            self._request_refresh()
 
     def _build_ui(self):
         root = QVBoxLayout(self); root.setContentsMargins(18, 16, 18, 16); root.setSpacing(10)

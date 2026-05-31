@@ -44,7 +44,7 @@ from .wallet_export import _sanitize_dump_basename, FullWalletExportWorker
 from .wallet_import import FullWalletImportWorker, read_recent_wallet_rescan_state
 from .workers import NewAddressWorker, PollWorker, RefreshWorker, SendWorker, ShutdownWorker, StatusWorker
 from .dialogs import AboutDialog, BusyDialog, ConfigDialog, DiagDialog, ImportKeyDialog, KeyDisplayDialog, TxDetailDialog, _DraggableDialog, _ask_yes_no, _get_open_file_name, _get_save_file_name, _msg, _msg_critical, _msg_info
-from .helpers import _fmt_addr, _sort_addr_items, fmt_btcz, fmt_ts
+from .helpers import _fmt_addr, _sort_addr_items, fmt_btcz, fmt_ts, tx_status_code
 from .locales import tr
 from .models import AddressTableModel, TransactionTableModel, _AddrBalanceDelegate, _FromCombo, mk_view
 from .ui import _CenteredTabWidget, mk_card, slbl
@@ -588,6 +588,174 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         return busy
+
+    def _success_operation_txids(self) -> set[str]:
+        if self.cache is None:
+            return set()
+        txids: set[str] = set()
+        try:
+            for op in self.cache.list_operations(status="success", limit=200):
+                txid = str(op.get("txid", "") or "").strip()
+                if txid:
+                    txids.add(txid)
+        except Exception:
+            pass
+        return txids
+
+    def _fast_status_txids(self) -> list[str]:
+        tracked: list[str] = []
+        seen: set[str] = set()
+        inactive = {"failed", "expired", "conflicted", "reorged", "stale"}
+
+        def add(txid: str):
+            txid = str(txid or "").strip()
+            if txid and txid not in seen:
+                seen.add(txid)
+                tracked.append(txid)
+
+        for tx in list(self._cached_txs or []) + list((self._data or {}).get("txs", []) or []):
+            txid = str(tx.get("txid", "") or "").strip()
+            if not txid:
+                continue
+            status = tx_status_code(tx)
+            try:
+                confirms = int(tx.get("confirmations", 0) or 0)
+            except Exception:
+                confirms = 0
+            if status not in inactive and confirms < 6:
+                add(txid)
+
+        if self.cache is not None:
+            try:
+                for op in self.cache.list_operations(limit=200):
+                    txid = str(op.get("txid", "") or "").strip()
+                    status = str(op.get("status", "") or "").strip().lower()
+                    if not txid or status not in {"success", "submitted", "executing", "unknown"}:
+                        continue
+                    if status == "success":
+                        entries = self.cache.get_transaction_entries(txid)
+                        if entries:
+                            try:
+                                max_confirms = max(int(row.get("confirmations", 0) or 0) for row in entries)
+                            except Exception:
+                                max_confirms = 0
+                            if max_confirms >= 6:
+                                continue
+                    add(txid)
+            except Exception:
+                pass
+
+        return tracked
+
+    @staticmethod
+    def _merge_tx_status_update(row: dict, update: dict) -> bool:
+        changed = False
+        for field in (
+            "confirmations", "status", "blockhash", "blockheight", "blockindex",
+            "time", "blocktime", "timereceived", "fee",
+        ):
+            if field not in update:
+                continue
+            value = update.get(field)
+            if value in (None, ""):
+                continue
+            if field in {"confirmations", "blockheight", "blockindex", "time", "blocktime", "timereceived"}:
+                try:
+                    value = int(value)
+                except Exception:
+                    pass
+            if row.get(field) != value:
+                row[field] = value
+                changed = True
+        return changed
+
+    def _apply_fast_block_state(self, chain: dict, tx_updates: list[dict]):
+        if not self._data:
+            return
+
+        info = self._data.setdefault("info", {})
+        if isinstance(chain, dict) and chain.get("blocks") is not None:
+            info["blocks"] = chain.get("blocks")
+        if isinstance(chain, dict):
+            self._data.setdefault("chain", {}).update(chain)
+
+        updates_by_txid = {
+            str(update.get("txid", "") or "").strip(): update
+            for update in tx_updates or []
+            if str(update.get("txid", "") or "").strip()
+        }
+        if not updates_by_txid:
+            return
+
+        rows = list(self._data.get("txs", []) or [])
+        found_txids: set[str] = set()
+        changed_txids: set[str] = set()
+        for row in rows:
+            txid = str(row.get("txid", "") or "").strip()
+            update = updates_by_txid.get(txid)
+            if not update:
+                continue
+            found_txids.add(txid)
+            if self._merge_tx_status_update(row, update):
+                changed_txids.add(txid)
+
+        operation_txids = self._success_operation_txids()
+        for txid, update in updates_by_txid.items():
+            if txid in found_txids or txid not in operation_txids:
+                continue
+            new_row = {
+                "txid": txid,
+                "category": "",
+                "address": "",
+                "amount": 0.0,
+                "time": update.get("time") or update.get("blocktime") or update.get("timereceived") or int(time.time()),
+                **update,
+            }
+            rows.append(new_row)
+            changed_txids.add(txid)
+
+        if not changed_txids:
+            return
+
+        self._data["txs"] = rows
+        if self.cache is not None:
+            for txid in changed_txids:
+                update = updates_by_txid.get(txid) or {}
+                try:
+                    self.cache.update_transaction_reconcile(
+                        txid,
+                        status=update.get("status"),
+                        confirmations=update.get("confirmations"),
+                        blockhash=update.get("blockhash"),
+                    )
+                except Exception:
+                    pass
+
+        old_busy = set(self._busy_addresses)
+        self._busy_addresses = self._derive_busy_addresses(self._data)
+
+        new_t_bal = self._data.get("t_balances", {}) or {}
+        new_z_bal = self._data.get("z_balances", {}) or {}
+        own_addresses = set(self._data.get("t_addrs", []) or []) | set(self._data.get("z_addrs", []) or [])
+        self._cached_txs = self._txs_with_wallet_operation_receives(rows, own_addresses)
+        new_key = tx_fingerprint(self._cached_txs)
+        if new_key != self._tx_cache_key:
+            self._tx_cache_key = new_key
+            self._fill_tx(self._cached_txs)
+
+        if old_busy != self._busy_addresses:
+            self._update_summary_titles(
+                has_transparent_pending=bool(set(new_t_bal) & self._busy_addresses),
+                has_shielded_pending=bool(set(new_z_bal) & self._busy_addresses),
+            )
+            self._fill_t_table(new_t_bal)
+            self._fill_z_table(new_z_bal)
+            prev_data = self.combo_from.currentData()
+            self._fill_combo_from(
+                self._data.get("t_addrs", []), self._data.get("z_addrs", []),
+                new_t_bal, new_z_bal, prev_data
+            )
+            self._update_send_btn()
 
     def _txs_with_wallet_operation_receives(self, txs: list, own_addresses: set[str]) -> list:
         rows = list(txs or [])
@@ -1210,7 +1378,7 @@ class MainWindow(QMainWindow):
         if self._status_refresh_running:
             return
         self._status_refresh_running = True
-        w = StatusWorker(self.rpc)
+        w = StatusWorker(self.rpc, txids=self._fast_status_txids())
         self._threads.append(w)
         w.finished.connect(lambda: self._threads.remove(w) if w in self._threads else None)
         w.done.connect(self._on_status_done)
@@ -1229,6 +1397,7 @@ class MainWindow(QMainWindow):
             pass
         self.lbl_blocks.setText(tr("dialogs.main_window.blocks", value=blocks))
         self.lbl_peers.setText(tr("dialogs.main_window.peers", value=peers))
+        self._apply_fast_block_state(chain, data.get("tx_updates", []) if isinstance(data, dict) else [])
 
         if self._rescan_status_active:
             return
