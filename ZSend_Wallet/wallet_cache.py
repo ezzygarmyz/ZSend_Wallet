@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BTCZ_ZAT = Decimal("100000000")
 
 
@@ -143,6 +143,12 @@ class WalletCache:
                     updated_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS addresses (
                     address TEXT PRIMARY KEY,
                     type TEXT NOT NULL,
@@ -263,6 +269,23 @@ class WalletCache:
                     """,
                     (str(now_ts()), now_ts()),
                 )
+            self._conn.executescript(
+                """
+                UPDATE transactions
+                SET raw_json = NULL,
+                    details_json = NULL
+                WHERE raw_json IS NOT NULL
+                   OR details_json IS NOT NULL;
+
+                UPDATE operations
+                SET memo = NULL,
+                    error = NULL,
+                    result_json = NULL
+                WHERE memo IS NOT NULL
+                   OR error IS NOT NULL
+                   OR result_json IS NOT NULL;
+                """
+            )
             self._conn.execute(
                 """
                 INSERT INTO schema_meta(key, value)
@@ -298,6 +321,35 @@ class WalletCache:
         with self._lock:
             row = self._execute(
                 "SELECT value FROM wallet_state WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return default
+        value = row["value"]
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value
+
+    def set_app_setting(self, key: str, value: Any) -> None:
+        payload = value if isinstance(value, str) else json_dumps(value)
+        with self._lock:
+            self._execute(
+                """
+                INSERT INTO app_settings(key, value, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, payload, now_ts()),
+            )
+            self._conn.commit()
+
+    def get_app_setting(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            row = self._execute(
+                "SELECT value FROM app_settings WHERE key = ?",
                 (key,),
             ).fetchone()
         if row is None:
@@ -516,8 +568,8 @@ class WalletCache:
                     timestamp = excluded.timestamp,
                     timereceived = excluded.timereceived,
                     status = excluded.status,
-                    raw_json = COALESCE(excluded.raw_json, transactions.raw_json),
-                    details_json = COALESCE(excluded.details_json, transactions.details_json),
+                    raw_json = NULL,
+                    details_json = NULL,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -534,8 +586,8 @@ class WalletCache:
                     tx_timestamp(tx),
                     int(tx.get("timereceived", 0) or 0) or None,
                     status,
-                    json_dumps(raw) if raw is not None else None,
-                    json_dumps(details) if details is not None else None,
+                    None,
+                    None,
                     ts,
                 ),
             )
@@ -717,7 +769,7 @@ class WalletCache:
                 """
                 SELECT 1
                 FROM operations
-                WHERE lower(status) IN ('submitted', 'executing', 'unknown')
+                WHERE lower(status) IN ('submitted', 'queued', 'executing')
                 LIMIT 1
                 """
             ).fetchone()
@@ -727,12 +779,10 @@ class WalletCache:
                 """
                 SELECT 1
                 FROM transactions
-                WHERE lower(status) IN ('pending', 'stale', 'reorged', 'conflicted')
-                   OR confirmations < 0
-                   OR (
-                        confirmations = 0
-                        AND lower(COALESCE(status, '')) NOT IN ('failed', 'expired')
-                   )
+                WHERE confirmations = 0
+                  AND lower(COALESCE(status, '')) NOT IN (
+                      'failed', 'expired', 'stale', 'reorged', 'conflicted'
+                  )
                 LIMIT 1
                 """
             ).fetchone()
@@ -769,10 +819,10 @@ class WalletCache:
                     to_address = COALESCE(excluded.to_address, operations.to_address),
                     amount_zat = COALESCE(excluded.amount_zat, operations.amount_zat),
                     fee_zat = COALESCE(excluded.fee_zat, operations.fee_zat),
-                    memo = COALESCE(excluded.memo, operations.memo),
+                    memo = NULL,
                     txid = COALESCE(excluded.txid, operations.txid),
-                    error = COALESCE(excluded.error, operations.error),
-                    result_json = COALESCE(excluded.result_json, operations.result_json),
+                    error = NULL,
+                    result_json = NULL,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -783,10 +833,10 @@ class WalletCache:
                     to_address,
                     btcz_to_zat(amount) if amount is not None else None,
                     btcz_to_zat(fee) if fee is not None else None,
-                    memo,
+                    None,
                     txid,
-                    error,
-                    json_dumps(result) if result is not None else None,
+                    None,
+                    None,
                     ts,
                     ts,
                 ),
@@ -808,16 +858,14 @@ class WalletCache:
                 UPDATE operations
                 SET status = ?,
                     txid = COALESCE(?, txid),
-                    error = COALESCE(?, error),
-                    result_json = COALESCE(?, result_json),
+                    error = NULL,
+                    result_json = NULL,
                     updated_at = ?
                 WHERE opid = ?
                 """,
                 (
                     status,
                     txid,
-                    error,
-                    json_dumps(result) if result is not None else None,
                     now_ts(),
                     opid,
                 ),

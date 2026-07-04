@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import os
+import re
 import time
 import traceback
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import requests
 from PySide6.QtCore import QThread, Signal
 
 from .common import (
+    DATA_DIR,
     PARAMS_DIR,
     PARAMS_FILES,
     _NODE_MSGS,
@@ -20,11 +24,228 @@ from .common import (
 )
 from .debug_runtime import debug_exception, debug_log
 from .rpc import BitcoinZRPC, RPCError
-from .wallet_cache import WalletCache
+from .wallet_cache import WalletCache, btcz_to_zat
 
 _PARAMS_DOWNLOAD_CHUNK = 1 << 20
 _PARAMS_PROGRESS_MIN_BYTES = 4 << 20
 _PARAMS_PROGRESS_MIN_SECONDS = 0.25
+_REINDEX_PROGRESS_MAX_VALUE = 9500
+_REINDEX_FINALIZING_VALUE = 10000
+_REINDEX_LOG_TAIL_MAX_BYTES = 256 * 1024
+_REINDEX_BLOCK_FILE_RE = re.compile(r"Reindexing block file blk(\d{5})\.dat", re.IGNORECASE)
+_BOOTSTRAP_START_RE = re.compile(r"Importing bootstrap\.dat", re.IGNORECASE)
+_BOOTSTRAP_PREALLOC_RE = re.compile(r"Pre-allocating up to position 0x[0-9a-f]+ in blk(\d{5})\.dat", re.IGNORECASE)
+_BOOTSTRAP_LOADED_RE = re.compile(r"Loaded \d+ blocks from external file", re.IGNORECASE)
+_BOOTSTRAP_NODE_START_MARKERS = ("BitcoinZ version",)
+_NODE_START_MARKERS = (
+    "BitcoinZ version",
+    "init message:",
+    "scheduler thread start",
+    "dnsseed thread start",
+    "net thread start",
+)
+
+
+def _clone_rpc(rpc: BitcoinZRPC) -> BitcoinZRPC:
+    clone = getattr(rpc, "clone", None)
+    return clone() if callable(clone) else rpc
+
+
+def reindex_progress_value(current_index: int, max_index: int) -> int:
+    if max_index <= 0:
+        return 0
+    current = max(0, min(int(current_index), int(max_index)))
+    return max(0, min(_REINDEX_PROGRESS_MAX_VALUE, round((current / int(max_index)) * _REINDEX_PROGRESS_MAX_VALUE)))
+
+
+def reindex_block_file_label(current_index: int, max_index: int) -> str:
+    return f"Reindexing block file {max(0, int(current_index))} / {max(0, int(max_index))}"
+
+
+def _chain_sync_percent(chain: dict) -> float:
+    try:
+        return max(0.0, min(100.0, float(chain.get("verificationprogress")) * 100.0))
+    except Exception:
+        pass
+    try:
+        blocks = int(chain.get("blocks", 0) or 0)
+        headers = int(chain.get("headers", 0) or 0)
+        if headers > 0:
+            return max(0.0, min(100.0, (blocks / headers) * 100.0))
+    except Exception:
+        pass
+    return 0.0
+
+
+def max_reindex_blk_index(blocks_dir: Path | None = None) -> int:
+    blocks_dir = blocks_dir or (DATA_DIR / "blocks")
+    indexes: list[int] = []
+    try:
+        candidates = list(blocks_dir.glob("blk*.dat"))
+    except OSError:
+        return -1
+    for path in candidates:
+        m = re.fullmatch(r"blk(\d{5})\.dat", path.name, re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            indexes.append(int(m.group(1)))
+        except ValueError:
+            pass
+    return max(indexes) if indexes else -1
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def _read_log_tail_after(log_path: Path, start_offset: int = 0, max_bytes: int = _REINDEX_LOG_TAIL_MAX_BYTES) -> list[str]:
+    try:
+        size = int(log_path.stat().st_size)
+    except OSError:
+        return []
+    if size <= 0:
+        return []
+    if start_offset < 0 or start_offset > size:
+        start_offset = 0
+    read_start = max(start_offset, max(0, size - max_bytes))
+    try:
+        with open(log_path, "rb") as fh:
+            fh.seek(read_start, os.SEEK_SET)
+            text = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    if read_start > start_offset:
+        newline = text.find("\n")
+        if newline != -1:
+            text = text[newline + 1:]
+    return text.splitlines()
+
+
+def reindex_progress_from_debug_log(
+    log_path: Path | None = None,
+    *,
+    max_blk_index: int,
+    start_offset: int = 0,
+    include_finished: bool = True,
+    reset_on_node_start: bool = False,
+) -> dict | None:
+    log_path = log_path or (DATA_DIR / "debug.log")
+    lines = _read_log_tail_after(log_path, start_offset=start_offset)
+    if not lines:
+        return None
+
+    last_index: int | None = None
+    finished = False
+    for line in lines:
+        if reset_on_node_start and any(marker in line for marker in _NODE_START_MARKERS):
+            last_index = None
+            finished = False
+            continue
+        match = _REINDEX_BLOCK_FILE_RE.search(line)
+        if match:
+            last_index = int(match.group(1))
+            finished = False
+            continue
+        if "Reindexing finished" in line:
+            finished = True
+
+    if finished:
+        if not include_finished:
+            return None
+        if max_blk_index >= 0:
+            return {
+                "phase": "finalizing",
+                "message": "Finalizing reindex",
+                "bar_text": "Finalizing reindex",
+                "bar_value": _REINDEX_FINALIZING_VALUE,
+                "current_blk_index": max_blk_index,
+                "max_blk_index": max_blk_index,
+            }
+        return {
+            "phase": "finalizing",
+            "message": "Finalizing reindex",
+            "bar_text": "Finalizing reindex",
+            "bar_value": _REINDEX_FINALIZING_VALUE,
+        }
+
+    if last_index is not None:
+        if max_blk_index >= 0:
+            current = max(0, min(last_index, max_blk_index))
+            return {
+                "phase": "reindex_files",
+                "message": reindex_block_file_label(current, max_blk_index),
+                "bar_text": reindex_block_file_label(current, max_blk_index),
+                "bar_value": reindex_progress_value(current, max_blk_index),
+                "current_blk_index": current,
+                "max_blk_index": max_blk_index,
+            }
+        return {
+            "phase": "reindex_files",
+            "message": f"Reindexing block file {last_index}",
+            "bar_text": "Reindexing block files",
+            "bar_value": 0,
+        }
+
+    return None
+
+
+def bootstrap_progress_from_debug_log(
+    log_path: Path | None = None,
+    *,
+    start_offset: int = 0,
+    reset_on_node_start: bool = True,
+) -> dict | None:
+    log_path = log_path or (DATA_DIR / "debug.log")
+    lines = _read_log_tail_after(log_path, start_offset=start_offset)
+    if not lines:
+        return None
+
+    active = False
+    current_index: int | None = None
+    for line in lines:
+        if reset_on_node_start and any(marker in line for marker in _BOOTSTRAP_NODE_START_MARKERS):
+            active = False
+            current_index = None
+            continue
+        if _BOOTSTRAP_START_RE.search(line):
+            active = True
+            current_index = None
+            continue
+        if not active:
+            continue
+        match = _BOOTSTRAP_PREALLOC_RE.search(line)
+        if match:
+            try:
+                current_index = int(match.group(1))
+            except ValueError:
+                current_index = None
+            continue
+        if _BOOTSTRAP_LOADED_RE.search(line):
+            active = False
+            current_index = None
+
+    if not active:
+        return None
+    if current_index is not None:
+        blk_name = f"blk{current_index:05d}.dat"
+        return {
+            "phase": "bootstrap_files",
+            "message": "Bootstrap sync",
+            "bar_text": blk_name,
+            "bar_value": 0,
+            "current_blk_index": current_index,
+            "blk_name": blk_name,
+        }
+    return {
+        "phase": "bootstrap_files",
+        "message": "Bootstrap sync",
+        "bar_text": "Bootstrap sync",
+        "bar_value": 0,
+    }
 
 
 class ParamsWorker(QThread):
@@ -226,13 +447,21 @@ class ParamsWorker(QThread):
             self.failed.emit(f"ZcashParams check failed unexpectedly:\n{e}")
 
 
+_NODE_READY_POLL_SECS = 3
+_NODE_READY_MAX_COLD_WAIT_SECS = 360
+
+
+def _is_node_busy_message(code: int, message: str) -> bool:
+    return code == -28 or any(k in message for k in _NODE_MSGS)
+
+
 class NodeStartWorker(QThread):
     status = Signal(str)
     ready  = Signal()
     failed = Signal(str)
 
     def __init__(self, rpc: BitcoinZRPC):
-        super().__init__(); self.rpc = rpc
+        super().__init__(); self.rpc = _clone_rpc(rpc)
 
     def run(self):
         try:
@@ -264,7 +493,7 @@ class NodeStartWorker(QThread):
                         "then restart the node."
                     )
                     return
-                if e.code == -28 or any(k in msg for k in _NODE_MSGS):
+                if _is_node_busy_message(e.code, msg):
                     should_launch = False
             except Exception as e:
                 debug_exception("Initial configured RPC probe failed unexpectedly", e)
@@ -284,18 +513,31 @@ class NodeStartWorker(QThread):
             elif not binary:
                 self.status.emit("bitcoinzd.exe not found - waiting for manual start")
 
-            for attempt in range(120):
+            attempt = 0
+            cold_wait_started = time.monotonic()
+            seen_node_busy = False
+            while True:
+                attempt += 1
                 try:
-                    debug_log("RPC readiness probe", attempt=attempt + 1)
+                    debug_log("RPC readiness probe", attempt=attempt)
                     self.rpc.getBlockchainInfo()
-                    debug_log("Node RPC responded successfully", attempt=attempt + 1)
+                    debug_log("Node RPC responded successfully", attempt=attempt)
                     self.status.emit("Node is ready!")
                     self.ready.emit()
                     return
                 except RPCError as e:
                     msg  = str(e)
                     code = e.code
-                    debug_log("RPC readiness probe failed", attempt=attempt + 1, code=code, rpc_message=msg)
+                    node_busy = _is_node_busy_message(code, msg)
+                    seen_node_busy = seen_node_busy or node_busy
+                    debug_log(
+                        "RPC readiness probe failed",
+                        attempt=attempt,
+                        code=code,
+                        rpc_message=msg,
+                        node_busy=node_busy,
+                        seen_node_busy=seen_node_busy,
+                    )
 
                     if code == 401:
                         self.failed.emit(
@@ -313,28 +555,305 @@ class NodeStartWorker(QThread):
                         )
                         return
 
-                    if code == -28 or any(k in msg for k in _NODE_MSGS):
+                    if node_busy:
                         display = next(
                             (v for k, v in _NODE_MSGS.items() if k in msg),
                             msg.splitlines()[0]
                         )
                         self.status.emit(display)
                     elif "Connection refused" in msg or "refused" in msg.lower():
-                        self.status.emit(f"Waiting for node ({attempt * 3}s)")
+                        self.status.emit(f"Waiting for node ({attempt * _NODE_READY_POLL_SECS}s)")
                     else:
                         self.status.emit(f"Waiting ({msg.splitlines()[0][:60]})")
 
-                time.sleep(3)
+                if not seen_node_busy:
+                    cold_wait_elapsed = time.monotonic() - cold_wait_started
+                    if cold_wait_elapsed >= _NODE_READY_MAX_COLD_WAIT_SECS:
+                        debug_log(
+                            "NodeStartWorker timed out waiting for cold node",
+                            elapsed_seconds=round(cold_wait_elapsed, 1),
+                        )
+                        self.failed.emit(
+                            "Node did not respond within 360 seconds.\n"
+                            "Check that bitcoinzd.exe is present and bitcoinz.conf is correct.\n"
+                            "Open Diagnostics for details."
+                        )
+                        return
 
-            debug_log("NodeStartWorker timed out waiting for node")
-            self.failed.emit(
-                "Node did not respond within 360 seconds.\n"
-                "Check that bitcoinzd.exe is present and bitcoinz.conf is correct.\n"
-                "Open Diagnostics for details."
-            )
+                time.sleep(_NODE_READY_POLL_SECS)
         except Exception as e:
             debug_exception("NodeStartWorker failed unexpectedly", e)
             self.failed.emit(f"Node start failed unexpectedly:\n{e}")
+
+
+class MaintenanceRestartWorker(QThread):
+    status = Signal(str)
+    progress = Signal(object)
+    done = Signal(str)
+    error = Signal(str)
+
+    _POLL_SECS = 3
+    _STOP_WAIT_SECS = 300
+
+    def __init__(self, rpc: BitcoinZRPC, mode: str):
+        super().__init__()
+        mode = str(mode or "").strip().lower()
+        if mode not in {"rescan", "reindex"}:
+            mode = "rescan"
+        self.rpc = _clone_rpc(rpc)
+        self.mode = mode
+        self._stop_requested = False
+        self._detach_requested = False
+        self._debug_log_start_offset = 0
+        self._max_blk_index = -1
+        self._last_progress_key: tuple | None = None
+
+    def _emit_progress(
+        self,
+        phase: str,
+        message: str,
+        *,
+        bar_text: str | None = None,
+        bar_value: int = 0,
+        percent: float | None = None,
+        current_blk_index: int | None = None,
+        max_blk_index: int | None = None,
+    ):
+        payload = {
+            "phase": phase,
+            "message": message,
+            "bar_text": bar_text or "",
+            "bar_value": max(0, min(10000, int(bar_value or 0))),
+        }
+        if percent is not None:
+            try:
+                payload["percent"] = max(0.0, min(100.0, float(percent)))
+            except Exception:
+                payload["percent"] = 0.0
+        if current_blk_index is not None:
+            payload["current_blk_index"] = int(current_blk_index)
+        if max_blk_index is not None:
+            payload["max_blk_index"] = int(max_blk_index)
+        key = (
+            payload["phase"],
+            payload["message"],
+            payload["bar_text"],
+            payload["bar_value"],
+            payload.get("percent"),
+            payload.get("current_blk_index"),
+            payload.get("max_blk_index"),
+        )
+        if key == self._last_progress_key:
+            return
+        self._last_progress_key = key
+        self.progress.emit(payload)
+
+    def _read_reindex_progress_hint(self) -> dict | None:
+        if self.mode != "reindex":
+            return None
+        return reindex_progress_from_debug_log(
+            DATA_DIR / "debug.log",
+            max_blk_index=self._max_blk_index,
+            start_offset=self._debug_log_start_offset,
+        )
+
+    def _emit_reindex_progress_hint(self, hint: dict | None = None) -> bool:
+        if self.mode != "reindex":
+            return False
+        hint = hint or self._read_reindex_progress_hint()
+        if not hint:
+            return False
+        self._emit_progress(
+            str(hint.get("phase", "reindex_files")),
+            str(hint.get("message", "")),
+            bar_text=str(hint.get("bar_text", "")),
+            bar_value=int(hint.get("bar_value", 0) or 0),
+            current_blk_index=hint.get("current_blk_index"),
+            max_blk_index=hint.get("max_blk_index"),
+        )
+        return True
+
+    def stop(self):
+        self._stop_requested = True
+        try:
+            _clone_rpc(self.rpc).stopNode()
+        except Exception:
+            pass
+
+    def detach(self):
+        self._detach_requested = True
+
+    def _sleep_poll(self, seconds: float):
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while time.monotonic() < deadline:
+            if self._stop_requested:
+                raise RuntimeError("Node maintenance cancelled")
+            if self._detach_requested:
+                raise RuntimeError("Node maintenance detached")
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
+    @staticmethod
+    def _is_connection_refused(message: str) -> bool:
+        msg = str(message or "").lower()
+        return (
+            "connection refused" in msg
+            or "failed to establish a new connection" in msg
+            or "actively refused" in msg
+            or "max retries exceeded" in msg
+        )
+
+    def _status_from_rpc_error(self, e: RPCError) -> str:
+        msg = str(e)
+        if self._is_connection_refused(msg):
+            return "Waiting for BitcoinZ node to start"
+        return next((v for k, v in _NODE_MSGS.items() if k in msg), msg.splitlines()[0][:80])
+
+    def _wait_for_rpc_down(self):
+        deadline = time.monotonic() + self._STOP_WAIT_SECS
+        while time.monotonic() < deadline:
+            if self._stop_requested:
+                raise RuntimeError("Node maintenance cancelled")
+            rpc_down = False
+            try:
+                self.rpc.getBlockchainInfo()
+            except RPCError as e:
+                if "stopping" in str(e).lower():
+                    rpc_down = True
+                elif self._is_connection_refused(str(e)):
+                    rpc_down = True
+                else:
+                    rpc_down = True
+            except Exception:
+                rpc_down = True
+            if rpc_down and not node_running():
+                return
+            self.status.emit("Waiting for node to stop")
+            time.sleep(1)
+
+    def _wait_until_ready(self, proc=None):
+        attempt = 0
+        while True:
+            if self._stop_requested:
+                raise RuntimeError("Node maintenance cancelled")
+            if self._detach_requested:
+                raise RuntimeError("Node maintenance detached")
+            if proc is not None and proc.poll() is not None and not node_running():
+                raise RuntimeError(f"bitcoinzd.exe exited before RPC became available (exit code {proc.returncode})")
+            reindex_hint = self._read_reindex_progress_hint()
+            hint_emitted = self._emit_reindex_progress_hint(reindex_hint)
+            attempt += 1
+            chain = None
+            try:
+                chain = self.rpc.getBlockchainInfo() or {}
+                if bool(chain.get("reindex")):
+                    if not hint_emitted:
+                        self._emit_progress("reindex_files", "Reindexing blockchain", bar_text="Reindexing block files", bar_value=0)
+                        self.status.emit("Reindexing blockchain")
+                    self._sleep_poll(self._POLL_SECS)
+                    continue
+                if self.mode == "reindex" and isinstance(reindex_hint, dict) and str(reindex_hint.get("phase", "")) == "reindex_files":
+                    self._sleep_poll(self._POLL_SECS)
+                    continue
+                pct = _chain_sync_percent(chain)
+                if bool(chain.get("initialblockdownload")) or (
+                    chain.get("verificationprogress") is not None and pct < 99.9
+                ):
+                    self._emit_progress(
+                        "syncing",
+                        "Synchronizing blockchain",
+                        bar_value=int(pct * 100),
+                        percent=pct,
+                    )
+                    self.status.emit("Synchronizing blockchain")
+                    self._sleep_poll(self._POLL_SECS)
+                    continue
+                # Probe a wallet RPC that does not touch the keypool. During
+                # -rescan this usually returns a busy error until wallet scan
+                # has finished, while getblockchaininfo can already be ready.
+                self.rpc.z_getTotalBalance()
+                return
+            except RPCError as e:
+                if e.code in (401, 403):
+                    raise
+                if self.mode == "reindex" and _is_reindex_err(e):
+                    if isinstance(chain, dict):
+                        pct = _chain_sync_percent(chain)
+                        if chain.get("verificationprogress") is not None and pct < 99.9:
+                            self._emit_progress(
+                                "syncing",
+                                "Synchronizing blockchain",
+                                bar_value=int(pct * 100),
+                                percent=pct,
+                            )
+                            self.status.emit("Synchronizing blockchain")
+                            self._sleep_poll(self._POLL_SECS)
+                            continue
+                    if not self._emit_reindex_progress_hint():
+                        self._emit_progress(
+                            "finalizing",
+                            "Finalizing reindex",
+                            bar_text="Finalizing reindex",
+                            bar_value=_REINDEX_FINALIZING_VALUE,
+                        )
+                    self._sleep_poll(self._POLL_SECS)
+                    continue
+                self.status.emit(self._status_from_rpc_error(e))
+            except Exception:
+                self.status.emit(f"Waiting for node ({attempt * self._POLL_SECS}s)")
+            self._sleep_poll(self._POLL_SECS)
+
+    def _recover_normal_node(self, binary, failed_label: str, failure: Exception):
+        self.status.emit("Maintenance start failed; restoring normal node")
+        self._emit_progress("recovering", "Maintenance start failed; restoring normal node")
+        proc = launch_node(binary)
+        if proc is None:
+            raise RuntimeError(f"{failure}\n\nRecovery failed: bitcoinzd.exe could not be started normally.")
+        self._wait_until_ready(proc)
+        raise RuntimeError(f"{failed_label} did not start successfully:\n{failure}\n\nBitcoinZ node was restarted normally.")
+
+    def run(self):
+        try:
+            label = f"-{self.mode}"
+            self.status.emit("Stopping BitcoinZ node")
+            self._emit_progress("stopping", "Stopping BitcoinZ node")
+            try:
+                self.rpc.stopNode()
+            except Exception as exc:
+                debug_exception("Maintenance stopNode failed or node was already down", exc)
+            self._wait_for_rpc_down()
+
+            binary = find_node()
+            if binary is None:
+                self.error.emit("bitcoinzd.exe not found")
+                return
+
+            if self.mode == "reindex":
+                self._max_blk_index = max_reindex_blk_index()
+                self._debug_log_start_offset = _file_size(DATA_DIR / "debug.log")
+            self.status.emit(f"Starting BitcoinZ node with {label}")
+            self._emit_progress("starting", f"Starting BitcoinZ node with {label}")
+            proc = launch_node(binary, extra_args=[label])
+            if proc is None:
+                self._recover_normal_node(binary, label, RuntimeError(f"Failed to start bitcoinzd.exe with {label}"))
+
+            self.status.emit(f"Waiting for {label} to finish")
+            if self.mode == "reindex":
+                self._emit_progress("reindex_files", "Reindexing blockchain", bar_text="Reindexing block files", bar_value=0)
+            try:
+                self._wait_until_ready(proc)
+            except RuntimeError as e:
+                if "cancelled" in str(e).lower() or "detached" in str(e).lower():
+                    raise
+                self._recover_normal_node(binary, label, e)
+            self.done.emit(self.mode)
+        except RPCError as e:
+            self.error.emit(str(e))
+        except Exception as e:
+            if "detached" in str(e).lower():
+                debug_log("MaintenanceRestartWorker detached; node left running", mode=self.mode)
+                return
+            debug_exception("MaintenanceRestartWorker failed unexpectedly", e)
+            self.error.emit(str(e))
 
 
 _REINDEX_PHRASES = ("reindexing", "while reindexing", "disabled while", "reindex")
@@ -353,9 +872,17 @@ class RefreshWorker(QThread):
     def __init__(self, rpc: BitcoinZRPC, cache: WalletCache | None = None,
                  force_full: bool = False):
         super().__init__()
-        self.rpc = rpc
+        self.rpc = _clone_rpc(rpc)
         self.cache = cache
         self.force_full = force_full
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+        self.requestInterruption()
+
+    def _should_stop(self) -> bool:
+        return bool(self._stop_requested or self.isInterruptionRequested())
 
     @staticmethod
     def _snapshot_block(data: dict) -> int | None:
@@ -516,6 +1043,8 @@ class RefreshWorker(QThread):
     def _store_cache_snapshot(self, data: dict, job_type: str = "refresh") -> None:
         if self.cache is None:
             return
+        if self._should_stop():
+            return
         job_id = None
         try:
             job_id = self.cache.start_sync_job(
@@ -540,6 +1069,58 @@ class RefreshWorker(QThread):
                 self.cache.set_state("last_cache_error", str(e))
             except Exception:
                 pass
+
+    def _run_reconciliation(self, data: dict) -> None:
+        if self.cache is None:
+            return
+        try:
+            cached_sum_zat = self.cache.get_total_address_balance_zat(include_hidden=False)
+            total_zat = btcz_to_zat((data.get("total_bal") or {}).get("total", 0))
+            delta = abs(cached_sum_zat - total_zat)
+            self.cache.set_state("last_reconcile_delta_zat", delta)
+            self.cache.set_state("last_reconciled_at", int(time.time()))
+
+            live_txs = [tx for tx in (data.get("txs") or []) if tx.get("txid")]
+            live_map = {str(tx.get("txid")): tx for tx in live_txs}
+            live_txids = set(live_map)
+            if live_txids:
+                self.cache.clear_transactions_stale(live_txids)
+
+            cached_rows = self.cache.list_transactions(limit=500, newest_first=True)
+            cached_txids = {str(row.get("txid", "")) for row in cached_rows if row.get("txid")}
+            for row in cached_rows:
+                if self._should_stop():
+                    return
+                txid = str(row.get("txid", "") or "")
+                if not txid or txid not in live_map:
+                    continue
+                live_tx = live_map[txid]
+                live_confirms = int(live_tx.get("confirmations", 0) or 0)
+                live_blockhash = str(live_tx.get("blockhash", "") or "")
+                cached_blockhash = str(row.get("blockhash", "") or "")
+                status = None
+                if live_confirms < 0:
+                    status = "conflicted"
+                elif cached_blockhash and live_blockhash and cached_blockhash != live_blockhash:
+                    status = "reorged"
+                elif live_confirms == 0:
+                    status = "pending"
+                elif live_confirms > 0:
+                    status = "confirmed"
+                if status is not None:
+                    self.cache.update_transaction_reconcile(
+                        txid,
+                        status=status,
+                        confirmations=live_confirms,
+                        blockhash=live_blockhash or None,
+                    )
+
+            if live_txids and data.get("tx_snapshot_complete"):
+                stale_txids = cached_txids - live_txids
+                if stale_txids:
+                    self.cache.mark_transactions_stale(stale_txids)
+        except Exception:
+            pass
 
     def _enrich_transactions(self, txs: list) -> list:
         if not txs:
@@ -740,6 +1321,16 @@ class RefreshWorker(QThread):
 
     def _reindex_emit(self, info, chain, t_addrs=(), z_addrs=(),
                       t_bal=None, z_bal=None, total_bal=None):
+        reindex_progress = reindex_progress_from_debug_log(
+            DATA_DIR / "debug.log",
+            max_blk_index=max_reindex_blk_index(),
+            include_finished=False,
+            reset_on_node_start=True,
+        )
+        bootstrap_progress = bootstrap_progress_from_debug_log(
+            DATA_DIR / "debug.log",
+            reset_on_node_start=True,
+        )
         data = {
             "info": info, "chain": chain,
             "t_addrs": list(t_addrs), "z_addrs": list(z_addrs),
@@ -747,18 +1338,29 @@ class RefreshWorker(QThread):
             "total_bal": total_bal or {}, "txs": [],
             "tx_snapshot_complete": False,
             "reindexing": True,
+            "reindex_progress": reindex_progress,
+            "bootstrap_progress": bootstrap_progress,
         }
         self._store_cache_snapshot(data, "refresh_reindexing")
         self.reindexing.emit(data)
 
     def run(self):
         try:
+            if self._should_stop():
+                return
             self.step.emit("getblockchaininfo")
             try:
                 chain = self.rpc.getBlockchainInfo()
+            except RPCError as e:
+                if _is_reindex_err(e):
+                    chain = {}
+                else:
+                    raise
             except Exception:
-                chain = {}
+                raise
             info = self._build_info_from_chain(chain)
+            if self._should_stop():
+                return
 
             if chain.get("reindex", False) or chain.get("initialblockdownload", False):
                 self._reindex_emit(info, chain)
@@ -773,18 +1375,14 @@ class RefreshWorker(QThread):
                     return
                 raise
 
-            self.step.emit("wallet info")
-            try:
-                wallet_info = self.rpc.getWalletInfo()
-                if not isinstance(wallet_info, dict):
-                    wallet_info = {}
-            except RPCError as e:
-                if _is_reindex_err(e):
-                    self._reindex_emit(info, chain, total_bal=total_bal)
-                    return
-                wallet_info = {}
-            except Exception:
-                wallet_info = {}
+            # Do not poll getwalletinfo from the 30s refresh loop.
+            # BitcoinZ getwalletinfo calls GetOldestKeyPoolTime(), which
+            # reserves and returns a key only to inspect the keypool. That is
+            # harmless for wallet state, but it spams debug.log with
+            # "keypool reserve/return" on every UI refresh.
+            wallet_info = {}
+            if self._should_stop():
+                return
 
             if self.cache is not None and not self.force_full:
                 block_height = self._snapshot_block({"info": info})
@@ -802,6 +1400,8 @@ class RefreshWorker(QThread):
                             tx_limit=200,
                         )
                         self._store_cache_snapshot(data, "refresh_cached_reuse")
+                        if self._should_stop():
+                            return
                         self.done.emit(data)
                         return
                 except Exception:
@@ -888,6 +1488,9 @@ class RefreshWorker(QThread):
                 "reindexing": False,
             }
             self._store_cache_snapshot(data)
+            self._run_reconciliation(data)
+            if self._should_stop():
+                return
             self.done.emit(data)
 
         except RPCError as e:
@@ -912,7 +1515,7 @@ class RefreshWorker(QThread):
 
 
 class StatusWorker(QThread):
-    _TX_PROBE_LIMIT = 40
+    _TX_PROBE_LIMIT = 8
     done = Signal(object)
     error = Signal(str)
 
@@ -922,6 +1525,7 @@ class StatusWorker(QThread):
         self.port = rpc.port
         self.user = rpc.user
         self.password = rpc.password
+        self._stop_requested = False
         seen: set[str] = set()
         self.txids: list[str] = []
         for txid in txids or []:
@@ -932,6 +1536,13 @@ class StatusWorker(QThread):
             self.txids.append(txid)
             if len(self.txids) >= self._TX_PROBE_LIMIT:
                 break
+
+    def stop(self):
+        self._stop_requested = True
+        self.requestInterruption()
+
+    def _should_stop(self) -> bool:
+        return bool(self._stop_requested or self.isInterruptionRequested())
 
     @staticmethod
     def _status_from_confirmations(confirmations: int) -> str:
@@ -988,8 +1599,12 @@ class StatusWorker(QThread):
 
     def run(self):
         try:
+            if self._should_stop():
+                return
             rpc = BitcoinZRPC(self.host, self.port, self.user, self.password)
             chain = rpc.getBlockchainInfo() or {}
+            if self._should_stop():
+                return
             peers = "-"
             try:
                 net = rpc.getNetworkInfo()
@@ -1000,12 +1615,33 @@ class StatusWorker(QThread):
                     peers = rpc.getConnectionCount()
                 except Exception:
                     pass
+            reindex_progress = reindex_progress_from_debug_log(
+                DATA_DIR / "debug.log",
+                max_blk_index=max_reindex_blk_index(),
+                start_offset=0,
+                include_finished=bool(chain.get("reindex")),
+                reset_on_node_start=True,
+            )
+            bootstrap_progress = bootstrap_progress_from_debug_log(
+                DATA_DIR / "debug.log",
+                reset_on_node_start=True,
+            )
             tx_updates = []
             for txid in self.txids:
+                if self._should_stop():
+                    return
                 update = self._probe_transaction(rpc, txid)
                 if update:
                     tx_updates.append(update)
-            self.done.emit({"chain": chain, "peers": peers, "tx_updates": tx_updates})
+            if self._should_stop():
+                return
+            self.done.emit({
+                "chain": chain,
+                "peers": peers,
+                "tx_updates": tx_updates,
+                "reindex_progress": reindex_progress,
+                "bootstrap_progress": bootstrap_progress,
+            })
         except RPCError as e:
             self.error.emit(str(e))
         except Exception as e:
@@ -1016,45 +1652,140 @@ class PollWorker(QThread):
     status_update = Signal(str)
     success       = Signal(str)
     failed        = Signal(str)
+    cancelled     = Signal(str)
+    unknown       = Signal(str)
 
-    def __init__(self, rpc: BitcoinZRPC, opid: str):
+    TOTAL_TIMEOUT_SECONDS = 20 * 60
+    EMPTY_STATUS_LIMIT = 5
+    RPC_ERROR_LIMIT = 10
+
+    def __init__(
+        self,
+        rpc: BitcoinZRPC,
+        opid: str,
+        *,
+        timeout_seconds: float | None = None,
+        empty_status_limit: int | None = None,
+        rpc_error_limit: int | None = None,
+        sleep_func=None,
+    ):
         super().__init__()
-        self.rpc   = rpc
+        self.rpc   = _clone_rpc(rpc)
         self.opid  = opid
         self._stop = False
+        self.timeout_seconds = (
+            self.TOTAL_TIMEOUT_SECONDS if timeout_seconds is None else float(timeout_seconds)
+        )
+        self.empty_status_limit = (
+            self.EMPTY_STATUS_LIMIT if empty_status_limit is None else int(empty_status_limit)
+        )
+        self.rpc_error_limit = (
+            self.RPC_ERROR_LIMIT if rpc_error_limit is None else int(rpc_error_limit)
+        )
+        self._sleep_func = sleep_func or time.sleep
 
     def stop(self):
         self._stop = True
 
+    @staticmethod
+    def _extract_txid(item) -> str:
+        if not isinstance(item, dict):
+            return ""
+        result = item.get("result")
+        if isinstance(result, dict):
+            txid = result.get("txid") or result.get("txId")
+            return str(txid or "").strip()
+        if isinstance(result, str) and len(result.strip()) == 64:
+            return result.strip()
+        return ""
+
+    def _cleanup_finished_result(self):
+        try:
+            res = self.rpc.z_getOperationResult(self.opid)
+        except Exception:
+            return []
+        return res if isinstance(res, list) else []
+
+    @staticmethod
+    def _poll_interval(elapsed: float) -> float:
+        if elapsed < 30:
+            return 2.0
+        if elapsed < 180:
+            return 5.0
+        if elapsed < 600:
+            return 10.0
+        return 15.0
+
+    def _sleep_interruptible(self, seconds: float):
+        remaining = max(0.0, float(seconds))
+        while remaining > 0 and not self._stop:
+            chunk = min(0.5, remaining)
+            self._sleep_func(chunk)
+            remaining -= chunk
+
     def run(self):
+        started_at = time.monotonic()
+        empty_status_count = 0
+        rpc_error_count = 0
         while not self._stop:
+            elapsed = time.monotonic() - started_at
             try:
                 res = self.rpc.z_getOperationStatus(self.opid)
                 if res and isinstance(res, list) and res:
-                    s = res[0].get("status", "")
+                    empty_status_count = 0
+                    rpc_error_count = 0
+                    item = res[0] if isinstance(res[0], dict) else {}
+                    s = str(item.get("status", "") or "").strip().lower()
                     if s == "success":
-                        res2 = self.rpc.z_getOperationResult(self.opid)
-                        txid = ""
-                        if res2 and isinstance(res2, list) and res2:
-                            txid = res2[0].get("result", {}).get("txid", "")
-                        self.success.emit(txid or "?")
+                        txid = self._extract_txid(item)
+                        if not txid:
+                            for done_item in self._cleanup_finished_result():
+                                txid = self._extract_txid(done_item)
+                                if txid:
+                                    break
+                        else:
+                            self._cleanup_finished_result()
+                        if txid:
+                            self.success.emit(txid)
+                        else:
+                            self.unknown.emit("Send operation completed, but the node did not return a transaction id.")
                         return
-                    elif s == "failed":
-                        err = res[0].get("error", {})
+                    if s == "failed":
+                        err = item.get("error", {})
                         msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                         self.failed.emit(msg)
                         return
+                    if s == "cancelled":
+                        self.cancelled.emit("Send operation was cancelled by the node.")
+                        return
+                    if s in {"queued", "executing"}:
+                        self.status_update.emit(s)
                     else:
-                        self.status_update.emit(f"Status: {s}")
+                        self.unknown.emit(f"Unexpected send operation status: {s or 'empty'}")
+                        return
                 else:
-                    self.status_update.emit("Waiting for confirmation")
+                    empty_status_count += 1
+                    self.status_update.emit("queued")
+                    if empty_status_count >= self.empty_status_limit:
+                        self.unknown.emit("Send operation id is no longer visible in the node.")
+                        return
             except RPCError as e:
-                self.status_update.emit(f"Polling error: {e}")
-            except Exception:
-                pass
-            for _ in range(8):
-                if self._stop: return
-                time.sleep(0.5)
+                rpc_error_count += 1
+                self.status_update.emit("executing")
+                if rpc_error_count >= self.rpc_error_limit:
+                    self.unknown.emit(f"Could not poll send operation status: {e}")
+                    return
+            except Exception as e:
+                rpc_error_count += 1
+                debug_exception("PollWorker.run", e)
+                self.status_update.emit("executing")
+                if rpc_error_count >= self.rpc_error_limit:
+                    self.unknown.emit("Could not poll send operation status.")
+                    return
+            if self.timeout_seconds >= 0 and (time.monotonic() - started_at) >= self.timeout_seconds:
+                self.unknown.emit("Send operation polling timed out.")
+                return
+            self._sleep_interruptible(self._poll_interval(elapsed))
 
 
 class SendPreflightWorker(QThread):
@@ -1063,7 +1794,7 @@ class SendPreflightWorker(QThread):
 
     def __init__(self, rpc: BitcoinZRPC, frm: str, to: str):
         super().__init__()
-        self.rpc = rpc
+        self.rpc = _clone_rpc(rpc)
         self.frm = frm
         self.to = to
 
@@ -1090,7 +1821,7 @@ class NewAddressWorker(QThread):
 
     def __init__(self, rpc: BitcoinZRPC, shielded: bool):
         super().__init__()
-        self.rpc = rpc
+        self.rpc = _clone_rpc(rpc)
         self.shielded = bool(shielded)
 
     def run(self):
@@ -1110,7 +1841,7 @@ class SendWorker(QThread):
     def __init__(self, rpc: BitcoinZRPC, frm: str, to: str,
                  amount: float, fee: float, memo: str = ""):
         super().__init__()
-        self.rpc = rpc; self.frm = frm; self.to = to
+        self.rpc = _clone_rpc(rpc); self.frm = frm; self.to = to
         self.amount = amount; self.fee = fee; self.memo = memo
 
     def run(self):
@@ -1130,7 +1861,7 @@ class ShutdownWorker(QThread):
     done   = Signal()
 
     def __init__(self, rpc: BitcoinZRPC):
-        super().__init__(); self.rpc = rpc
+        super().__init__(); self.rpc = _clone_rpc(rpc)
 
     def run(self):
         self.status.emit("Sending stop command to node")

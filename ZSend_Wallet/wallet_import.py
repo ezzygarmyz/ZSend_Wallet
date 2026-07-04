@@ -11,6 +11,12 @@ from .common import DATA_DIR
 from .locales import tr
 from .rpc import BitcoinZRPC, RPCError
 
+
+def _clone_rpc(rpc: BitcoinZRPC) -> BitcoinZRPC:
+    clone = getattr(rpc, "clone", None)
+    return clone() if callable(clone) else rpc
+
+
 class ImportKeyWorker(QThread):
     progress       = Signal(str)
     done           = Signal(str)
@@ -20,7 +26,7 @@ class ImportKeyWorker(QThread):
     def __init__(self, rpc: BitcoinZRPC, key: str, is_z: bool,
                  start_height: int = 0):
         super().__init__()
-        self.rpc = rpc; self.key = key; self.is_z = is_z
+        self.rpc = _clone_rpc(rpc); self.key = key; self.is_z = is_z
         self.start_height = int(start_height)
 
     def run(self):
@@ -45,7 +51,7 @@ class ImportPreflightWorker(QThread):
 
     def __init__(self, rpc: BitcoinZRPC, is_z: bool):
         super().__init__()
-        self.rpc = rpc
+        self.rpc = _clone_rpc(rpc)
         self.is_z = bool(is_z)
 
     @staticmethod
@@ -84,7 +90,7 @@ class FullWalletImportWorker(QThread):
 
     def __init__(self, rpc: BitcoinZRPC, dump_path: Path):
         super().__init__()
-        self.rpc = rpc
+        self.rpc = _clone_rpc(rpc)
         self.dump_path = Path(dump_path)
 
     def run(self):

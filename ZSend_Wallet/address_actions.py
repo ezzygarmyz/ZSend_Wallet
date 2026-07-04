@@ -10,7 +10,12 @@ from .common import qrcode
 from .dialogs import KeyDisplayDialog, _DraggableDialog, _get_save_file_name, _msg_critical
 from .helpers import fmt_btcz, safe_set_text
 from .locales import tr
-from .rpc import RPCError
+from .rpc import BitcoinZRPC, RPCError
+
+
+def _clone_rpc(rpc: BitcoinZRPC) -> BitcoinZRPC:
+    clone = getattr(rpc, "clone", None)
+    return clone() if callable(clone) else rpc
 
 
 class ExportKeyWorker(QThread):
@@ -19,7 +24,7 @@ class ExportKeyWorker(QThread):
 
     def __init__(self, rpc, addr: str, is_z: bool):
         super().__init__()
-        self.rpc = rpc
+        self.rpc = _clone_rpc(rpc)
         self.addr = addr
         self.is_z = bool(is_z)
 

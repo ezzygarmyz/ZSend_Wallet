@@ -29,6 +29,12 @@ class BitcoinZRPC:
         self._session.mount("http://", adapter)
         self._lock = __import__("threading").Lock()
 
+    def endpoint(self) -> tuple[str, int, str, str]:
+        return (self.host, self.port, self.user, self.password)
+
+    def clone(self) -> "BitcoinZRPC":
+        return BitcoinZRPC(*self.endpoint())
+
     def call(self, method: str, params: list, timeout: int = 30):
         body = json.dumps({
             "jsonrpc": "1.0",

@@ -45,6 +45,11 @@ from .wallet_cache import WalletCache
 from .wallet_import import ImportKeyWorker, ImportPreflightWorker, LogTailWorker
 
 
+def _clone_rpc(rpc: BitcoinZRPC) -> BitcoinZRPC:
+    clone = getattr(rpc, "clone", None)
+    return clone() if callable(clone) else rpc
+
+
 class _DraggableDialog(QDialog):
 
     def __init__(self, parent=None):
@@ -174,18 +179,25 @@ class _MessageDialog(_DraggableDialog):
                  buttons: list[tuple[str, int]] | None = None, default_button: int | None = None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setMinimumWidth(440)
         self._result = 0
         if buttons is None:
             buttons = [(tr("common.buttons.ok"), int(QMessageBox.StandardButton.Ok))]
 
+        preferred_w = 500 if len(str(text or "")) < 420 else 560
+        parent_widget = self.parentWidget()
+        screen = (parent_widget.screen() if parent_widget else self.screen()) or QApplication.primaryScreen()
+        if screen is not None:
+            preferred_w = min(preferred_w, max(360, screen.availableGeometry().width() - 80))
+        self.setMinimumWidth(min(420, preferred_w))
+
         v = QVBoxLayout(self)
-        v.setContentsMargins(20, 18, 20, 18)
-        v.setSpacing(12)
+        v.setContentsMargins(20, 18, 20, 16)
+        v.setSpacing(10)
 
         hdr = QLabel(title)
+        hdr.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         hdr.setStyleSheet(
-            "font-size:14px;font-weight:700;"
+            "font-size:14px;font-weight:800;"
             + {
                 "info": "color:#58a6ff;",
                 "warning": "color:#f7a32c;",
@@ -200,8 +212,8 @@ class _MessageDialog(_DraggableDialog):
             body.setReadOnly(True)
             body.setPlainText(body_text)
             body.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-            body.setMinimumHeight(120)
-            body.setMaximumHeight(320)
+            body.setMinimumHeight(110)
+            body.setMaximumHeight(280)
             body.setStyleSheet(
                 "QTextEdit{background:#161b22;color:#e6edf3;border:1px solid #30363d;"
                 "border-radius:6px;padding:8px;font-size:12px;}"
@@ -209,21 +221,36 @@ class _MessageDialog(_DraggableDialog):
         else:
             body = QLabel(body_text)
             body.setWordWrap(True)
+            body.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            body.setStyleSheet("color:#e6edf3;font-size:12px;")
+            body.setFixedWidth(max(320, preferred_w - 40))
+            body.setStyleSheet("color:#e6edf3;font-size:12px;line-height:140%;")
         v.addWidget(body)
 
+        line = QFrame()
+        line.setObjectName("div")
+        line.setFixedHeight(1)
+        v.addWidget(line)
+
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
         row.addStretch()
         for label, value in buttons:
             btn = QPushButton(label)
-            btn.setMinimumWidth(88)
+            btn.setMinimumWidth(max(88, min(150, btn.sizeHint().width() + 24)))
+            btn.setFixedHeight(34)
             if default_button is not None and value == default_button:
                 btn.setObjectName("primary")
             btn.clicked.connect(lambda _=False, v=value: self._finish(v))
             row.addWidget(btn)
         v.addLayout(row)
-        self._fit_to_screen(560, min(520, max(180, self.sizeHint().height() + 20)), min_w=360, min_h=160)
+
+        self.setFixedWidth(preferred_w)
+        self.adjustSize()
+        preferred_h = min(520, max(150, self.sizeHint().height()))
+        self._fit_to_screen(preferred_w, preferred_h, min_w=min(420, preferred_w), min_h=min(150, preferred_h))
+        self.setFixedSize(self.size())
 
     def _finish(self, value: int):
         self._result = value
@@ -255,9 +282,12 @@ def _msg_critical(parent, title: str, text: str) -> None:
 
 
 def _ask_yes_no(parent, title: str, text: str, *, yes_text: str | None = None, no_text: str | None = None,
-                kind: str = "warning") -> bool:
+                kind: str = "warning", default_yes: bool | None = True) -> bool:
     yes_text = yes_text or tr("common.buttons.yes")
     no_text = no_text or tr("common.buttons.no")
+    default_button = None
+    if default_yes is not None:
+        default_button = int(QMessageBox.StandardButton.Yes if default_yes else QMessageBox.StandardButton.No)
     result = _msg(
         parent,
         title,
@@ -267,7 +297,7 @@ def _ask_yes_no(parent, title: str, text: str, *, yes_text: str | None = None, n
             (no_text, int(QMessageBox.StandardButton.No)),
             (yes_text, int(QMessageBox.StandardButton.Yes)),
         ],
-        default_button=int(QMessageBox.StandardButton.Yes),
+        default_button=default_button,
     )
     return result == int(QMessageBox.StandardButton.Yes)
 
@@ -346,6 +376,11 @@ class DiagDialog(_DraggableDialog):
         self.btn_copy.setMinimumWidth(150)
         self.btn_copy.clicked.connect(self._copy_report)
         h.addWidget(self.btn_copy)
+        self.btn_clear_db = QPushButton(tr("dialogs.diagnostics.clear_database"))
+        self.btn_clear_db.setMinimumWidth(140)
+        self.btn_clear_db.setEnabled(self._cache is not None)
+        self.btn_clear_db.clicked.connect(self._clear_database)
+        h.addWidget(self.btn_clear_db)
         h.addStretch()
         bc = QPushButton(tr("common.buttons.close")); bc.clicked.connect(self.accept); h.addWidget(bc)
         v.addLayout(h)
@@ -358,6 +393,7 @@ class DiagDialog(_DraggableDialog):
             self._diag_worker = None
         self.btn_rerun.setEnabled(False)
         self.btn_copy.setEnabled(False)
+        self.btn_clear_db.setEnabled(False)
         self.txt.setPlainText(tr("dialogs.diagnostics.running"))
         self._diag_worker = _DiagWorker(self._rpc, self._cache)
         self._diag_worker.done.connect(self._on_done)
@@ -368,6 +404,7 @@ class DiagDialog(_DraggableDialog):
         self.txt.setPlainText(text)
         self.btn_rerun.setEnabled(True)
         self.btn_copy.setEnabled(True)
+        self.btn_clear_db.setEnabled(self._cache is not None)
         self._diag_worker = None
 
     def closeEvent(self, event):
@@ -384,10 +421,38 @@ class DiagDialog(_DraggableDialog):
         self.btn_copy.setText(tr("common.buttons.copied"))
         QTimer.singleShot(2000, lambda: safe_set_text(self.btn_copy, tr("dialogs.diagnostics.copy_report")))
 
+    def _clear_database(self):
+        if self._cache is None:
+            return
+        if not _ask_yes_no(
+            self,
+            tr("dialogs.diagnostics.clear_database_title"),
+            tr("dialogs.diagnostics.clear_database_confirm"),
+            yes_text=tr("dialogs.diagnostics.clear_database"),
+            no_text=tr("common.buttons.no"),
+            kind="warning",
+            default_yes=False,
+        ):
+            return
+        try:
+            parent = self.parentWidget()
+            if parent is not None and hasattr(parent, "clear_wallet_cache"):
+                parent.clear_wallet_cache(refresh=True)
+            else:
+                self._cache.clear_runtime_cache()
+            self.txt.setPlainText(tr("dialogs.diagnostics.clear_database_done"))
+            QTimer.singleShot(700, self._start)
+        except Exception as e:
+            _msg_critical(self, tr("dialogs.diagnostics.clear_database_title"), str(e))
+
 class BusyDialog(_DraggableDialog):
-    def __init__(self, parent, title: str, message: str):
+    def __init__(self, parent, title: str, message: str,
+                 cancel_text: str | None = None, on_cancel=None,
+                 hide_text: str | None = None):
         super().__init__(parent)
         self._busy = True
+        self._on_cancel = on_cancel
+        self._allow_hide = bool(hide_text)
         self.setWindowTitle(title)
         self.setMinimumWidth(440)
         v = QVBoxLayout(self)
@@ -405,23 +470,65 @@ class BusyDialog(_DraggableDialog):
         self.bar.setFormat(tr("dialogs.busy.please_wait"))
         self.bar.setFixedHeight(20)
         v.addWidget(self.bar)
-        self.btn_close = QPushButton(tr("common.buttons.close"))
-        self.btn_close.setEnabled(False)
-        self.btn_close.clicked.connect(self.accept)
-        v.addWidget(self.btn_close, 0, Qt.AlignmentFlag.AlignRight)
+        row = QHBoxLayout()
+        row.addStretch()
+        self.btn_cancel = None
+        if on_cancel is not None and hide_text:
+            self.btn_cancel = QPushButton(cancel_text or tr("common.buttons.close"))
+            self.btn_cancel.setObjectName("danger")
+            self.btn_cancel.clicked.connect(self._cancel)
+            row.addWidget(self.btn_cancel)
+            self.btn_close = QPushButton(hide_text)
+            self.btn_close.setEnabled(True)
+            self.btn_close.clicked.connect(self.accept)
+            row.addWidget(self.btn_close)
+        else:
+            self.btn_close = QPushButton(cancel_text or tr("common.buttons.close"))
+            self.btn_close.setEnabled(bool(on_cancel))
+            self.btn_close.clicked.connect(self._close_or_cancel)
+            row.addWidget(self.btn_close)
+        v.addLayout(row)
 
     def set_message(self, text: str):
         self.lbl.setText(text)
+
+    def set_progress(self, value: int | None = None, text: str | None = None, *, indeterminate: bool = False):
+        if indeterminate:
+            self.bar.setRange(0, 0)
+        else:
+            self.bar.setRange(0, 10000)
+            self.bar.setValue(max(0, min(10000, int(value or 0))))
+        if text:
+            self.bar.setFormat(text)
+
+    def _close_or_cancel(self):
+        if self._busy and self._on_cancel is not None:
+            self._cancel()
+            return
+        self.accept()
+
+    def _cancel(self):
+        button = self.btn_cancel or self.btn_close
+        button.setEnabled(False)
+        button.setText(tr("dialogs.busy.stopping"))
+        if self._on_cancel is not None:
+            self._on_cancel()
 
     def mark_finished(self):
         self._busy = False
         self.bar.setRange(0, 1)
         self.bar.setValue(1)
+        if self.btn_cancel is not None:
+            self.btn_cancel.setEnabled(False)
+        self.btn_close.setText(tr("common.buttons.close"))
         self.btn_close.setEnabled(True)
 
     def closeEvent(self, event):
         if self._busy:
-            event.ignore()
+            if self._allow_hide:
+                event.accept()
+            else:
+                event.ignore()
             return
         super().closeEvent(event)
 
@@ -431,7 +538,7 @@ class _DiagWorker(QThread):
 
     def __init__(self, rpc: BitcoinZRPC, cache: WalletCache | None = None):
         super().__init__()
-        self.rpc = rpc
+        self.rpc = _clone_rpc(rpc)
         self.cache = cache
 
     def run(self):
@@ -920,32 +1027,36 @@ class TxDetailsWorker(QThread):
 
     def __init__(self, rpc: BitcoinZRPC, txid: str):
         super().__init__()
-        self.rpc = rpc
+        self.host = rpc.host
+        self.port = rpc.port
+        self.user = rpc.user
+        self.password = rpc.password
         self.txid = txid
 
     def run(self):
         payload = {"full": {}, "raw": {}}
+        rpc = BitcoinZRPC(self.host, self.port, self.user, self.password)
         try:
-            chain = self.rpc.getBlockchainInfo() or {}
+            chain = rpc.getBlockchainInfo() or {}
             payload["chain_height"] = int(chain.get("blocks", 0) or 0)
         except Exception:
             payload["chain_height"] = 0
         try:
-            payload["full"] = self.rpc.getTransaction(self.txid) or {}
+            payload["full"] = rpc.getTransaction(self.txid) or {}
         except Exception:
             pass
         try:
-            payload["raw"] = self.rpc.getRawTransaction(self.txid) or {}
+            payload["raw"] = rpc.getRawTransaction(self.txid) or {}
         except Exception:
             pass
         try:
-            payload["shielded"] = self.rpc.z_viewTransaction(self.txid) or {}
+            payload["shielded"] = rpc.z_viewTransaction(self.txid) or {}
         except Exception:
             payload["shielded"] = {}
-        payload["prevouts"] = self._load_prevouts(payload.get("raw") or {})
+        payload["prevouts"] = self._load_prevouts(rpc, payload.get("raw") or {})
         self.done.emit(payload)
 
-    def _load_prevouts(self, raw: dict) -> dict:
+    def _load_prevouts(self, rpc: BitcoinZRPC, raw: dict) -> dict:
         prevouts = {}
         tx_cache = {}
         for vin in raw.get("vin", []) or []:
@@ -956,7 +1067,7 @@ class TxDetailsWorker(QThread):
             key = f"{prev_txid}:{prev_n}"
             try:
                 if prev_txid not in tx_cache:
-                    tx_cache[prev_txid] = self.rpc.getRawTransaction(prev_txid) or {}
+                    tx_cache[prev_txid] = rpc.getRawTransaction(prev_txid) or {}
                 prev_tx = tx_cache.get(prev_txid) or {}
                 prev_vouts = prev_tx.get("vout") or []
                 if 0 <= int(prev_n) < len(prev_vouts):
@@ -971,7 +1082,10 @@ class TxStatusWorker(QThread):
 
     def __init__(self, rpc: BitcoinZRPC, txid: str):
         super().__init__()
-        self.rpc = rpc
+        self.host = rpc.host
+        self.port = rpc.port
+        self.user = rpc.user
+        self.password = rpc.password
         self.txid = txid
 
     @staticmethod
@@ -984,17 +1098,18 @@ class TxStatusWorker(QThread):
 
     def run(self):
         payload = {"chain_height": 0, "tx": {}}
+        rpc = BitcoinZRPC(self.host, self.port, self.user, self.password)
         try:
-            chain = self.rpc.getBlockchainInfo() or {}
+            chain = rpc.getBlockchainInfo() or {}
             payload["chain_height"] = int(chain.get("blocks", 0) or 0)
         except Exception:
             pass
         source = {}
         try:
-            source = self.rpc.getTransaction(self.txid) or {}
+            source = rpc.getTransaction(self.txid) or {}
         except Exception:
             try:
-                source = self.rpc.getRawTransaction(self.txid) or {}
+                source = rpc.getRawTransaction(self.txid) or {}
             except Exception:
                 source = {}
         if isinstance(source, dict) and source:
@@ -2003,7 +2118,7 @@ class _NodeVersionWorker(QThread):
     done = Signal(object)
 
     def __init__(self, rpc: BitcoinZRPC):
-        super().__init__(); self.rpc = rpc
+        super().__init__(); self.rpc = _clone_rpc(rpc)
 
     def run(self):
         try:

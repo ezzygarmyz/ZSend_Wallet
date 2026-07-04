@@ -7,6 +7,7 @@ import platform
 import re
 import sys
 import threading
+import traceback
 from pathlib import Path
 
 from PySide6.QtCore import qInstallMessageHandler
@@ -41,10 +42,21 @@ def _safe_repr(value, limit: int = 400) -> str:
 
 
 def _sanitize_log_text(text: str) -> str:
+    text = str(text)
     text = re.sub(r"(?i)(rpcpassword\s*[=:]\s*)\S+", r"\1***", text)
     text = re.sub(r"(?i)(rpcuser\s*[=:]\s*)\S+", r"\1***", text)
     text = re.sub(r"(?i)(['\"]rpcpassword['\"]\s*:\s*['\"])[^'\"]+(['\"])", r"\1***\2", text)
     text = re.sub(r"(?i)(['\"]rpcuser['\"]\s*:\s*['\"])[^'\"]+(['\"])", r"\1***\2", text)
+    text = re.sub(
+        r"(?i)(?:[A-Za-z]:)?[\\/][^\s'\"<>|]*[\\/]ZSendWallet[\\/]secure(?:[\\/][^\s'\"<>|]*)?",
+        "***wallet-dump-path***",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:zsend_import_[A-Za-z0-9_]+\.dump|zsend_export_[A-Za-z0-9_]+\.dump|zsendexport[A-Za-z0-9]+|ZSendWalletExport[A-Za-z0-9]*)\b",
+        "***wallet-dump***",
+        text,
+    )
     text = re.sub(
         r"\bsecret-extended-key-(?:main|test|regtest)[0-9A-Za-z]+\b",
         "***shielded-secret***",
@@ -106,10 +118,16 @@ def debug_log(message: str, **fields) -> None:
 def debug_exception(context: str, exc: Exception | None = None) -> None:
     if not _DEBUG_LOG_INIT:
         return
+    safe_context = _sanitize_log_text(context)
     if exc is None:
-        _DEBUG_LOGGER.exception("%s", context)
+        _DEBUG_LOGGER.error("%s | %s", safe_context, _sanitize_log_text(traceback.format_exc()))
     else:
-        _DEBUG_LOGGER.exception("%s | %s", context, exc)
+        _DEBUG_LOGGER.error(
+            "%s | type=%s message=%s",
+            safe_context,
+            type(exc).__name__,
+            _sanitize_log_text(str(exc)),
+        )
 
 
 def install_qt_debug_logging() -> None:
@@ -160,13 +178,15 @@ def init_debug_logging() -> Path | None:
     _DEBUG_LOG_INIT = True
 
     def _log_excepthook(exc_type, exc_value, exc_tb):
-        _DEBUG_LOGGER.error("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+        formatted = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        _DEBUG_LOGGER.error("Unhandled exception | %s", _sanitize_log_text(formatted))
 
     def _thread_excepthook(args):
+        formatted = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
         _DEBUG_LOGGER.error(
-            "Unhandled thread exception | thread=%s",
+            "Unhandled thread exception | thread=%s traceback=%s",
             getattr(args, "thread", None),
-            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            _sanitize_log_text(formatted),
         )
 
     sys.excepthook = _log_excepthook

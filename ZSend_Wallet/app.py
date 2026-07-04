@@ -69,7 +69,7 @@ def main():
         password_present=bool(cfg.get("password")),
         conf_path=cfg.get("conf_path"),
         conf_found=cfg.get("conf_found"),
-        exportdir=cfg.get("exportdir"),
+        exportdir_configured=bool(cfg.get("exportdir")),
     )
     rpc = BitcoinZRPC(cfg["host"], cfg["port"], cfg["user"], cfg["password"])
     try:

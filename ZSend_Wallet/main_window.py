@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QLocale, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtGui import QAction, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -23,26 +23,28 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
 from .common import (
     CONF_PATH,
-    DATA_DIR,
     DEVELOPER_TIP_ADDRESS,
     _RUNNING_WORKERS,
     _is_z_addr,
     _track,
+    create_sensitive_text_file,
     ensure_exportdir,
     is_port_open,
+    resource_path,
     tx_fingerprint,
 )
 from .rpc import BitcoinZRPC, RPCError
 from .wallet_cache import WalletCache, btcz_to_zat, zat_to_float
 from .wallet_export import _sanitize_dump_basename, FullWalletExportWorker
 from .wallet_import import FullWalletImportWorker, read_recent_wallet_rescan_state
-from .workers import NewAddressWorker, PollWorker, RefreshWorker, SendWorker, ShutdownWorker, StatusWorker
+from .workers import MaintenanceRestartWorker, NewAddressWorker, PollWorker, RefreshWorker, SendWorker, ShutdownWorker, StatusWorker
 from .dialogs import AboutDialog, BusyDialog, ConfigDialog, DiagDialog, ImportKeyDialog, KeyDisplayDialog, TxDetailDialog, _DraggableDialog, _ask_yes_no, _get_open_file_name, _get_save_file_name, _msg, _msg_critical, _msg_info
 from .helpers import _fmt_addr, _sort_addr_items, fmt_btcz, fmt_ts, tx_status_code
 from .locales import tr
@@ -53,6 +55,17 @@ from . import address_actions, send_flow, shutdown_flow
 MIN_NODE_FEE_BTCZ = 0.00001
 MAX_NODE_FEE_BTCZ = 0.1
 MAX_BTCZ_MONEY = 21_000_000_000
+WALLET_IDENTITY_STATE_KEY = "wallet_identity_address"
+TRAY_ON_CLOSE_SETTING_KEY = "minimize_to_tray_on_close"
+
+
+def wallet_identity_candidate(data: dict) -> str:
+    addresses = [
+        str(addr or "").strip()
+        for addr in list((data or {}).get("t_addrs", []) or []) + list((data or {}).get("z_addrs", []) or [])
+    ]
+    addresses = sorted({addr for addr in addresses if addr})
+    return addresses[0] if addresses else ""
 
 
 class BtcZAmountSpinBox(QDoubleSpinBox):
@@ -116,13 +129,25 @@ class MainWindow(QMainWindow):
         self._full_export_worker = None
         self._full_import_worker = None
         self._busy_dialog = None
+        self._maintenance_worker = None
+        self._maintenance_dialog = None
         self._temp_wallet_dump_path: Path | None = None
+        self._force_real_exit = False
+        self._tray_icon: QSystemTrayIcon | None = None
+        self._tray_menu: QMenu | None = None
+        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        self._minimize_to_tray_on_close = self._load_minimize_to_tray_setting()
+        self._act_minimize_to_tray = None
         self._t_model = AddressTableModel(tr("dialogs.models.address"))
         self._z_model = AddressTableModel(tr("dialogs.main_window.tab_z"))
         self._tx_model = TransactionTableModel()
 
         self.raise_window.connect(self._bring_to_front)
         self._build_menu(); self._build_ui(); self._build_sb()
+        self._build_tray()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._hide_tray_icon)
         self._load_cached_snapshot()
 
         self._timer = QTimer(self); self._timer.timeout.connect(self.refresh)
@@ -140,23 +165,111 @@ class MainWindow(QMainWindow):
         self.setWindowState(Qt.WindowState.WindowActive)
         self.show(); self.raise_(); self.activateWindow()
 
+    def _load_minimize_to_tray_setting(self) -> bool:
+        if self.cache is None:
+            return True
+        try:
+            return bool(self.cache.get_app_setting(TRAY_ON_CLOSE_SETTING_KEY, True))
+        except Exception:
+            return True
+
+    def _set_minimize_to_tray_on_close(self, checked: bool):
+        self._minimize_to_tray_on_close = bool(checked)
+        if self.cache is not None:
+            try:
+                self.cache.set_app_setting(TRAY_ON_CLOSE_SETTING_KEY, self._minimize_to_tray_on_close)
+            except Exception:
+                pass
+
+    def _should_minimize_to_tray(self) -> bool:
+        return (
+            bool(self._tray_available)
+            and bool(self._minimize_to_tray_on_close)
+            and self._tray_icon is not None
+            and self._tray_icon.isVisible()
+        )
+
+    def _build_tray(self):
+        if not self._tray_available:
+            return
+        icon = QIcon(resource_path("icons/bitcoinz.ico"))
+        self._tray_menu = QMenu(self)
+        self._tray_menu.addAction(tr("dialogs.main_window.tray_open_wallet"), self._bring_to_front)
+        self._tray_menu.addAction(tr("dialogs.main_window.tray_stop_node_exit"), self._quit_and_stop)
+        self._tray_menu.addAction(tr("dialogs.main_window.tray_exit"), self._exit_gui)
+
+        self._tray_icon = QSystemTrayIcon(icon, self)
+        self._tray_icon.setToolTip(tr("dialogs.ui.app_title"))
+        self._tray_icon.setContextMenu(self._tray_menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._bring_to_front()
+
+    def _hide_tray_icon(self):
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+
+    def _exit_gui(self):
+        self._force_real_exit = True
+        self.close()
+        QApplication.quit()
+
     def closeEvent(self, event):
+        if not self._force_real_exit and self._should_minimize_to_tray():
+            event.ignore()
+            self.hide()
+            return
+        self._hide_tray_icon()
         self._timer.stop()
         if hasattr(self, "_status_timer"):
             self._status_timer.stop()
         if hasattr(self, "_reconcile_timer"):
             self._reconcile_timer.stop()
-        for w in list(_RUNNING_WORKERS):
+        workers = list(_RUNNING_WORKERS)
+        fast_sync_workers = (RefreshWorker, StatusWorker)
+        for w in workers:
+            if (
+                w is self._maintenance_worker
+                and getattr(w, "mode", "") == "reindex"
+                and hasattr(w, "detach")
+            ):
+                try:
+                    w.detach()
+                except Exception:
+                    pass
+                continue
             if hasattr(w, 'stop'):
                 try:
                     w.stop()
                 except Exception:
                     pass
-        for w in list(_RUNNING_WORKERS):
+            else:
+                try:
+                    w.requestInterruption()
+                except Exception:
+                    pass
+        deadline = time.monotonic() + 0.8
+        for w in workers:
             try:
-                w.wait(1500)
+                if not w.isRunning():
+                    continue
+                remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+                w.wait(remaining_ms)
             except Exception:
                 pass
+        for w in workers:
+            if isinstance(w, fast_sync_workers):
+                try:
+                    if w.isRunning():
+                        w.terminate()
+                        w.wait(200)
+                except Exception:
+                    pass
         super().closeEvent(event)
 
     def _build_menu(self):
@@ -172,11 +285,21 @@ class MainWindow(QMainWindow):
         self._update_wallet_key_actions()
         wm.addSeparator()
         self._act(wm, tr("dialogs.main_window.stop_node_exit"),  self._quit_and_stop)
-        self._act(wm, tr("dialogs.main_window.exit"),               self.close)
+        self._act(wm, tr("dialogs.main_window.exit"),               self._exit_gui)
         sm = mb.addMenu(tr("dialogs.main_window.settings_menu"))
         self._act(sm, tr("dialogs.main_window.rpc_connection"), self._open_cfg)
+        sm.addSeparator()
+        self._act_minimize_to_tray = QAction(tr("dialogs.main_window.minimize_to_tray_on_close"), self)
+        self._act_minimize_to_tray.setCheckable(True)
+        self._act_minimize_to_tray.setChecked(self._minimize_to_tray_on_close)
+        self._act_minimize_to_tray.setEnabled(self._tray_available)
+        self._act_minimize_to_tray.toggled.connect(self._set_minimize_to_tray_on_close)
+        sm.addAction(self._act_minimize_to_tray)
         hm = mb.addMenu(tr("dialogs.main_window.help_menu"))
         self._act(hm, tr("dialogs.main_window.full_diagnostics"), self._open_diag)
+        hm.addSeparator()
+        self._act_rescan_node = self._act(hm, tr("dialogs.main_window.rescan_blockchain"), lambda: self._start_node_maintenance("rescan"))
+        self._act_reindex_node = self._act(hm, tr("dialogs.main_window.reindex_blockchain"), lambda: self._start_node_maintenance("reindex"))
         hm.addSeparator()
         self._act(hm, tr("dialogs.main_window.about"), self._open_about)
 
@@ -201,6 +324,13 @@ class MainWindow(QMainWindow):
             action = getattr(self, name, None)
             if action is not None:
                 action.setEnabled(enabled)
+        maintenance_enabled = self._maintenance_worker is None
+        rescan_action = getattr(self, "_act_rescan_node", None)
+        if rescan_action is not None:
+            rescan_action.setEnabled(enabled and maintenance_enabled)
+        reindex_action = getattr(self, "_act_reindex_node", None)
+        if reindex_action is not None:
+            reindex_action.setEnabled(maintenance_enabled)
 
     def _build_ui(self):
         cw = QWidget(); self.setCentralWidget(cw)
@@ -475,10 +605,13 @@ class MainWindow(QMainWindow):
         self.tbl_tx = mk_view()
         self.tbl_tx.setModel(self._tx_model)
         hdr = self.tbl_tx.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.tbl_tx.setColumnWidth(0, 138)
+        self.tbl_tx.setColumnWidth(2, 76)
+        self.tbl_tx.setColumnWidth(3, 150)
         hdr.sectionClicked.connect(self._tx_header_click)
         self.tbl_tx.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tbl_tx.customContextMenuRequested.connect(self._tx_ctx)
@@ -553,9 +686,9 @@ class MainWindow(QMainWindow):
                     to_addr = str(op.get("to_address", "") or "").strip()
                     if not from_addr:
                         continue
-                    status = str(op.get("status", "") or "")
+                    status = str(op.get("status", "") or "").strip().lower()
                     txid = str(op.get("txid", "") or "").strip()
-                    if status in {"submitted", "executing"}:
+                    if status in {"submitted", "queued", "executing"}:
                         busy.add(from_addr)
                         if to_addr:
                             busy.add(to_addr)
@@ -613,6 +746,16 @@ class MainWindow(QMainWindow):
                 seen.add(txid)
                 tracked.append(txid)
 
+        if self._active_opid and self.cache is not None:
+            try:
+                for op in self.cache.list_operations(limit=50):
+                    if str(op.get("opid", "") or "") != self._active_opid:
+                        continue
+                    add(str(op.get("txid", "") or ""))
+                    break
+            except Exception:
+                pass
+
         for tx in list(self._cached_txs or []) + list((self._data or {}).get("txs", []) or []):
             txid = str(tx.get("txid", "") or "").strip()
             if not txid:
@@ -622,7 +765,7 @@ class MainWindow(QMainWindow):
                 confirms = int(tx.get("confirmations", 0) or 0)
             except Exception:
                 confirms = 0
-            if status not in inactive and confirms < 6:
+            if status not in inactive and confirms <= 0:
                 add(txid)
 
         if self.cache is not None:
@@ -630,18 +773,20 @@ class MainWindow(QMainWindow):
                 for op in self.cache.list_operations(limit=200):
                     txid = str(op.get("txid", "") or "").strip()
                     status = str(op.get("status", "") or "").strip().lower()
-                    if not txid or status not in {"success", "submitted", "executing", "unknown"}:
+                    if status in {"submitted", "queued", "executing"}:
+                        add(txid)
                         continue
-                    if status == "success":
-                        entries = self.cache.get_transaction_entries(txid)
-                        if entries:
-                            try:
-                                max_confirms = max(int(row.get("confirmations", 0) or 0) for row in entries)
-                            except Exception:
-                                max_confirms = 0
-                            if max_confirms >= 6:
-                                continue
-                    add(txid)
+                    if not txid or status != "success":
+                        continue
+                    entries = self.cache.get_transaction_entries(txid)
+                    if not entries:
+                        continue
+                    try:
+                        max_confirms = max(int(row.get("confirmations", 0) or 0) for row in entries)
+                    except Exception:
+                        max_confirms = 0
+                    if max_confirms <= 0:
+                        add(txid)
             except Exception:
                 pass
 
@@ -836,6 +981,14 @@ class MainWindow(QMainWindow):
             "connected": "#238636",
             "syncing": "#f7a32c",
         }
+        if not str(text or "").strip():
+            fallback = {
+                "offline": tr("dialogs.main_window.not_connected"),
+                "cached": tr("dialogs.main_window.cached_data"),
+                "connected": tr("dialogs.main_window.connected"),
+                "syncing": tr("dialogs.main_window.synchronizing"),
+            }.get(state, tr("dialogs.main_window.not_connected"))
+            text = "  " + fallback
         self.lbl_status.setText(text)
         if self._status_visual_state != state:
             self.lbl_status.setStyleSheet(
@@ -851,6 +1004,12 @@ class MainWindow(QMainWindow):
             "synced": "#238636",
             "idle": "#30363d",
         }
+        try:
+            value = max(0, min(10000, int(value)))
+        except Exception:
+            value = 0
+        if not str(text or "").strip():
+            text = self._sync_percent_text(value / 100.0)
         self.sync_bar.setValue(value)
         self.sync_bar.setFormat(text)
         if self._sync_visual_state != state:
@@ -858,6 +1017,18 @@ class MainWindow(QMainWindow):
                 f"QProgressBar#sbar::chunk{{background:{colors.get(state, '#30363d')};border-radius:3px}}"
             )
             self._sync_visual_state = state
+
+    def _keep_current_sync_visual(self, state: str = "syncing"):
+        value = self.sync_bar.value() if hasattr(self, "sync_bar") else 0
+        text = self.sync_bar.format() if hasattr(self, "sync_bar") else ""
+        self._set_sync_visual(state, value=value, text=text or self._sync_percent_text(value / 100.0))
+
+    def _sync_percent_text(self, percent: float = 0.0) -> str:
+        try:
+            pct = max(0.0, min(100.0, float(percent)))
+        except Exception:
+            pct = 0.0
+        return tr("dialogs.main_window.synchronization", percent=pct)
 
     def _load_cached_snapshot(self):
         if self.cache is None:
@@ -870,6 +1041,56 @@ class MainWindow(QMainWindow):
             return
         self._apply_wallet_data(data, cached=True)
 
+    def clear_wallet_cache(self, *, refresh: bool = True):
+        if self.cache is None:
+            return
+        self.cache.clear_runtime_cache()
+        self._data = {}
+        self._cached_txs = []
+        self._addr_balances = {}
+        self._busy_addresses = set()
+        self._tx_cache_key = ""
+        self._active_opid = ""
+        self._pending_send = None
+        self.lbl_total.setText("0")
+        self.lbl_priv.setText("0")
+        self.lbl_transp.setText("0")
+        self._update_summary_titles(has_transparent_pending=False, has_shielded_pending=False)
+        self._fill_t_table({})
+        self._fill_z_table({})
+        self.combo_from.blockSignals(True)
+        self.combo_from.clear()
+        self.combo_from.blockSignals(False)
+        self._fill_tx([])
+        self._update_summary()
+        self._update_wallet_key_actions()
+        if refresh:
+            self.refresh(force_full=True)
+
+    def _sync_wallet_cache_identity(self, data: dict) -> bool:
+        if self.cache is None:
+            return False
+        current = wallet_identity_candidate(data)
+        if not current:
+            return False
+        current_addresses = {
+            str(addr or "").strip()
+            for addr in list((data or {}).get("t_addrs", []) or []) + list((data or {}).get("z_addrs", []) or [])
+            if str(addr or "").strip()
+        }
+        try:
+            stored = str(self.cache.get_state(WALLET_IDENTITY_STATE_KEY, "") or "").strip()
+            if stored and stored not in current_addresses:
+                self.cache.clear_runtime_cache()
+                self.cache.store_refresh_snapshot(data)
+                self.cache.set_state(WALLET_IDENTITY_STATE_KEY, current)
+                return True
+            if not stored:
+                self.cache.set_state(WALLET_IDENTITY_STATE_KEY, current)
+        except Exception:
+            return False
+        return False
+
     def _apply_wallet_data(self, data: dict, cached: bool = False):
         self._data = data
         self._busy_addresses = self._derive_busy_addresses(data)
@@ -878,10 +1099,6 @@ class MainWindow(QMainWindow):
         try: self._cur_blocks = int(blocks)
         except Exception: pass
 
-        if cached:
-            self._set_status_visual("cached", "  " + tr("dialogs.main_window.cached_data"))
-        else:
-            self._set_status_visual("connected", "  " + tr("dialogs.main_window.connected"))
         self.lbl_blocks.setText(tr("dialogs.main_window.blocks", value=blocks))
         self.lbl_peers.setText(tr("dialogs.main_window.peers", value=peers))
 
@@ -890,23 +1107,26 @@ class MainWindow(QMainWindow):
             self._wallet_synced = False
             last_seen = data.get("last_refresh_at")
             self._last_sync_ts = last_seen or self._last_sync_ts
-            if last_seen:
-                self._set_sync_visual("cached", value=0, text=f"{tr('dialogs.main_window.cached')}  {fmt_ts(last_seen)}")
-            else:
-                self._set_sync_visual("cached", value=0, text=tr("dialogs.main_window.cached"))
+            self._set_status_visual("cached", "  " + tr("dialogs.main_window.cached_data"))
+            self._set_sync_visual("cached", value=0, text=self._sync_percent_text(0))
         elif vp is not None:
             pct = float(vp) * 100
             synced = pct >= 99.9
             self._wallet_synced = synced
             self._last_sync_ts = int(time.time())
+            self._set_status_visual(
+                "connected" if synced else "syncing",
+                "  " + (tr("dialogs.main_window.connected") if synced else tr("dialogs.main_window.synchronizing")),
+            )
             self._set_sync_visual(
                 "synced" if synced else "syncing",
                 value=int(pct * 100),
-                text=tr("dialogs.main_window.synchronization", percent=pct) if not synced else f"{tr('dialogs.main_window.connected')}  {pct:.2f}%"
+                text=self._sync_percent_text(pct),
             )
         else:
             self._wallet_synced = False
-            self._set_sync_visual("idle", value=0, text="-")
+            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.node_busy_cached"))
+            self._keep_current_sync_visual("syncing")
         self._update_wallet_key_actions()
 
         tb        = data.get("total_bal",  {})
@@ -1212,7 +1432,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        dump_basename = _sanitize_dump_basename(f"ZSendWalletExport{datetime.now().strftime('%Y%m%d%H%M%S')}")
+        dump_basename = _sanitize_dump_basename(f"zsendexport{token_hex(16)}")
         self._busy_dialog = BusyDialog(
             self,
             tr("dialogs.main_window.export_full_wallet_keys"),
@@ -1294,11 +1514,12 @@ class MainWindow(QMainWindow):
             kind="warning",
         ):
             return
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        temp_name = f"zsend_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{token_hex(8)}.dump"
-        self._temp_wallet_dump_path = DATA_DIR / temp_name
         try:
-            self._temp_wallet_dump_path.write_text(dump_text + "\n", encoding="utf-8")
+            self._temp_wallet_dump_path = create_sensitive_text_file(
+                "zsend_import_",
+                ".dump",
+                dump_text + "\n",
+            )
             dump_text = ""
             payload = {}
         except Exception as e:
@@ -1349,9 +1570,177 @@ class MainWindow(QMainWindow):
             h, p, u, pw = dlg.values(); self.rpc = BitcoinZRPC(h, p, u, pw); self.refresh(force_full=True)
 
     def _open_diag(self):  DiagDialog(self, self.rpc, self.cache).exec()
+
+    def _start_node_maintenance(self, mode: str):
+        mode = str(mode or "").strip().lower()
+        if mode not in {"rescan", "reindex"} or self._maintenance_worker is not None:
+            return
+        if mode == "rescan":
+            title = tr("dialogs.main_window.rescan_confirm_title")
+            message = tr("dialogs.main_window.rescan_confirm_message")
+        else:
+            title = tr("dialogs.main_window.reindex_confirm_title")
+            message = tr("dialogs.main_window.reindex_confirm_message")
+        if not _ask_yes_no(
+            self,
+            title,
+            message,
+            yes_text=tr("common.buttons.yes"),
+            no_text=tr("common.buttons.no"),
+            kind="warning",
+            default_yes=None,
+        ):
+            return
+
+        self._timer.stop()
+        self._status_timer.stop()
+        self._reconcile_timer.stop()
+        self._refresh_running = False
+        self._status_refresh_running = False
+        self.clear_wallet_cache(refresh=False)
+        self._wallet_synced = False
+        self._set_rescan_status_active(True)
+        self._set_status_visual("syncing", "  " + title)
+        self._set_sync_visual("syncing", value=0, text=self._sync_percent_text(0))
+
+        self._maintenance_dialog = None
+        self._maintenance_worker = MaintenanceRestartWorker(self.rpc, mode)
+        self._maintenance_worker.status.connect(self._on_node_maintenance_status)
+        self._maintenance_worker.progress.connect(self._on_node_maintenance_progress)
+        self._maintenance_worker.done.connect(self._on_node_maintenance_done)
+        self._maintenance_worker.error.connect(self._on_node_maintenance_error)
+        worker = self._maintenance_worker
+        self._maintenance_worker.finished.connect(lambda w=worker: self._remove_maintenance_worker(w))
+        self._threads.append(self._maintenance_worker)
+        self._update_wallet_key_actions()
+        _track(self._maintenance_worker).start()
+        if self._maintenance_dialog is not None:
+            self._maintenance_dialog.exec()
+
+    def _remove_maintenance_worker(self, worker):
+        if worker in self._threads:
+            self._threads.remove(worker)
+
+    def _restart_refresh_timers(self):
+        if not self._timer.isActive():
+            self._timer.start(30_000)
+        if not self._status_timer.isActive():
+            self._status_timer.start(2_000)
+        if not self._reconcile_timer.isActive():
+            self._reconcile_timer.start(300_000)
+
+    def _reindex_progress_text(self, payload: dict, fallback: str) -> str:
+        phase = str(payload.get("phase", "") or "").strip()
+        if phase == "reindex_files":
+            try:
+                current = int(payload.get("current_blk_index"))
+                total = int(payload.get("max_blk_index"))
+            except Exception:
+                return tr("dialogs.main_window.reindexing_block_files")
+            return tr("dialogs.main_window.reindexing_block_file", current=current, total=total)
+        if phase == "finalizing":
+            return tr("dialogs.main_window.finalizing_reindex")
+        return fallback
+
+    def _bootstrap_progress_text(self, payload: dict, fallback: str) -> str:
+        blk_name = str(payload.get("blk_name", "") or "").strip()
+        if not blk_name:
+            try:
+                blk_name = f"blk{int(payload.get('current_blk_index')):05d}.dat"
+            except Exception:
+                blk_name = ""
+        if blk_name:
+            return tr("dialogs.main_window.bootstrap_block_file", file=blk_name)
+        return fallback or tr("dialogs.main_window.bootstrap_sync")
+
+    def _on_node_maintenance_status(self, message: str):
+        message = str(message or "").strip()
+        if getattr(self._maintenance_worker, "mode", "") == "reindex":
+            if "synchronizing" in message.lower():
+                self._set_status_visual("syncing", "  " + tr("dialogs.main_window.synchronizing"))
+            elif message:
+                self._set_status_visual("syncing", "  " + tr("dialogs.main_window.reindex_confirm_title"))
+            return
+        if self._maintenance_dialog is not None and message:
+            self._maintenance_dialog.set_message(message)
+        if message:
+            self._set_status_visual("syncing", "  " + message)
+            if getattr(self._maintenance_worker, "mode", "") != "reindex":
+                self._set_sync_visual("syncing", value=0, text=self._sync_percent_text(0))
+
+    def _on_node_maintenance_progress(self, payload):
+        if not isinstance(payload, dict):
+            return
+        message = str(payload.get("message", "") or "").strip()
+        bar_text = str(payload.get("bar_text", "") or "").strip()
+        try:
+            bar_value = int(payload.get("bar_value", 0) or 0)
+        except Exception:
+            bar_value = 0
+        percent = payload.get("percent")
+        percent_text = None
+        if percent is not None:
+            try:
+                percent_text = self._sync_percent_text(float(percent))
+            except Exception:
+                percent_text = self._sync_percent_text(0)
+        display_text = bar_text or percent_text or self._sync_percent_text(0)
+        if getattr(self._maintenance_worker, "mode", "") == "reindex":
+            display_text = self._reindex_progress_text(payload, percent_text or display_text)
+        if message and self._maintenance_dialog is not None:
+            self._maintenance_dialog.set_message(message)
+        if self._maintenance_dialog is not None:
+            self._maintenance_dialog.set_progress(bar_value, display_text)
+        if getattr(self._maintenance_worker, "mode", "") == "reindex":
+            phase = str(payload.get("phase", "") or "")
+            status_text = (
+                tr("dialogs.main_window.synchronizing")
+                if phase == "syncing"
+                else tr("dialogs.main_window.reindex_confirm_title")
+            )
+            self._set_status_visual("syncing", "  " + status_text)
+        elif message:
+            self._set_status_visual("syncing", "  " + message)
+        self._set_sync_visual("syncing", value=bar_value, text=display_text)
+
+    def _cancel_node_maintenance(self):
+        if self._maintenance_dialog is not None:
+            self._maintenance_dialog.set_message(tr("dialogs.main_window.stopping_node"))
+        worker = self._maintenance_worker
+        if worker is not None and hasattr(worker, "stop"):
+            worker.stop()
+
+    def _on_node_maintenance_done(self, mode: str):
+        if self._maintenance_dialog is not None:
+            self._maintenance_dialog.mark_finished()
+            self._maintenance_dialog.accept()
+            self._maintenance_dialog = None
+        self._maintenance_worker = None
+        self._set_rescan_status_active(False)
+        self._restart_refresh_timers()
+        self._update_wallet_key_actions()
+        self._bring_to_front()
+        self.refresh(force_full=True)
+        self.refresh_status()
+
+    def _on_node_maintenance_error(self, message: str):
+        cancelled = "cancelled" in str(message or "").lower()
+        if self._maintenance_dialog is not None:
+            self._maintenance_dialog.mark_finished()
+            self._maintenance_dialog.accept()
+            self._maintenance_dialog = None
+        self._maintenance_worker = None
+        self._set_rescan_status_active(False)
+        self._restart_refresh_timers()
+        self._update_wallet_key_actions()
+        if not cancelled:
+            _msg_critical(self, tr("dialogs.main_window.node_maintenance_failed"), message)
+        self.refresh_status()
+
     def _open_about(self): AboutDialog(self, self.rpc).exec()
 
     def _quit_and_stop(self):
+        self._bring_to_front()
         shutdown_flow.start_shutdown(self)
 
     def _on_shutdown_done(self):
@@ -1375,6 +1764,8 @@ class MainWindow(QMainWindow):
         self.refresh(force_full=True)
 
     def refresh_status(self):
+        if self._maintenance_worker is not None:
+            return
         if self._status_refresh_running:
             return
         self._status_refresh_running = True
@@ -1402,16 +1793,59 @@ class MainWindow(QMainWindow):
         if self._rescan_status_active:
             return
 
+        bootstrap_payload = data.get("bootstrap_progress") if isinstance(data, dict) else None
+        if isinstance(bootstrap_payload, dict):
+            self._wallet_synced = False
+            try:
+                bar_value = int(bootstrap_payload.get("bar_value", 0) or 0)
+            except Exception:
+                bar_value = 0
+            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.bootstrap_sync"))
+            self._set_sync_visual(
+                "syncing",
+                value=bar_value,
+                text=self._bootstrap_progress_text(
+                    bootstrap_payload,
+                    tr("dialogs.main_window.bootstrap_sync"),
+                ),
+            )
+            self._update_wallet_key_actions()
+            return
+
+        progress_payload = data.get("reindex_progress") if isinstance(data, dict) else None
+        if bool(chain.get("reindex")) or isinstance(progress_payload, dict):
+            self._wallet_synced = False
+            if not isinstance(progress_payload, dict):
+                progress_payload = {"phase": "reindex_files", "bar_value": 0}
+            try:
+                bar_value = int(progress_payload.get("bar_value", 0) or 0)
+            except Exception:
+                bar_value = 0
+            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.reindex_confirm_title"))
+            self._set_sync_visual(
+                "syncing",
+                value=bar_value,
+                text=self._reindex_progress_text(
+                    progress_payload,
+                    tr("dialogs.main_window.reindexing_block_files"),
+                ),
+            )
+            self._update_wallet_key_actions()
+            return
+
         vp = chain.get("verificationprogress")
         if vp is None:
-            self._set_status_visual("connected", "  " + tr("dialogs.main_window.connected"))
-            self._set_sync_visual("idle", value=0, text="-")
+            self._wallet_synced = False
+            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.node_busy_cached"))
+            self._keep_current_sync_visual("syncing")
+            self._update_wallet_key_actions()
             return
         try:
             pct = max(0.0, min(100.0, float(vp) * 100))
         except Exception:
             pct = 0.0
         syncing = bool(chain.get("initialblockdownload") or chain.get("reindex")) or pct < 99.9
+        self._wallet_synced = not syncing
         self._set_status_visual(
             "syncing" if syncing else "connected",
             "  " + (tr("dialogs.main_window.synchronizing") if syncing else tr("dialogs.main_window.connected")),
@@ -1419,24 +1853,30 @@ class MainWindow(QMainWindow):
         self._set_sync_visual(
             "syncing" if syncing else "synced",
             value=int(pct * 100),
-            text=tr("dialogs.main_window.synchronization", percent=pct)
-            if syncing else f"{tr('dialogs.main_window.connected')}  {pct:.2f}%",
+            text=self._sync_percent_text(pct),
         )
+        self._update_wallet_key_actions()
 
     def _on_status_err(self, msg: str):
         self._status_refresh_running = False
         self._status_rpc_failures += 1
         if self._status_rpc_failures < 3:
             return
+        if is_port_open(self.rpc.host, self.rpc.port, timeout=0.5):
+            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.node_busy_cached"))
+            self._keep_current_sync_visual("syncing")
+            return
         if self._data:
             last_sync = fmt_ts(self._last_sync_ts) if self._last_sync_ts else "-"
             self._set_status_visual("offline", "  " + tr("dialogs.main_window.offline_cached"))
-            self._set_sync_visual("offline", value=0, text=tr("dialogs.main_window.offline_last_sync", value=last_sync))
+            self._set_sync_visual("offline", value=0, text=self._sync_percent_text(0))
         else:
             self._set_status_visual("offline", "  " + tr("dialogs.main_window.not_connected"))
-            self._set_sync_visual("offline", value=0, text=tr("dialogs.main_window.not_connected"))
+            self._set_sync_visual("offline", value=0, text=self._sync_percent_text(0))
 
     def refresh(self, force_full: bool = False):
+        if self._maintenance_worker is not None:
+            return
         if self._refresh_running: return
         self._refresh_running = True
         self._update_wallet_key_actions()
@@ -1452,8 +1892,8 @@ class MainWindow(QMainWindow):
     def _on_done(self, data: dict):
         self._refresh_running = False
         self._status_rpc_failures = 0
+        self._sync_wallet_cache_identity(data)
         self._apply_wallet_data(data, cached=False)
-        self._run_reconciliation(data)
         self._update_wallet_key_actions()
 
     def _on_err(self, msg: str):
@@ -1468,21 +1908,21 @@ class MainWindow(QMainWindow):
             self._set_sync_visual(
                 "syncing",
                 value=0,
-                text=tr("dialogs.main_window.wallet_rescan_in_progress")
+                text=self._sync_percent_text(0)
             )
             return
         if self._data and is_port_open(self.rpc.host, self.rpc.port, timeout=0.5):
             last_sync = fmt_ts(self._last_sync_ts) if self._last_sync_ts else "-"
             self._set_status_visual("syncing", "  " + tr("dialogs.main_window.node_busy_cached"))
-            self._set_sync_visual(
-                "syncing",
-                value=0,
-                text=tr("dialogs.main_window.cached_last_sync", value=last_sync),
-            )
+            self._keep_current_sync_visual("syncing")
+            return
+        if is_port_open(self.rpc.host, self.rpc.port, timeout=0.5):
+            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.node_busy_cached"))
+            self._keep_current_sync_visual("syncing")
             return
         self._set_status_visual("offline", "  " + (tr("dialogs.main_window.offline_cached") if self._data else tr("dialogs.main_window.not_connected")))
         last_sync = fmt_ts(self._last_sync_ts) if self._last_sync_ts else "-"
-        self._set_sync_visual("offline", value=0, text=tr("dialogs.main_window.offline_last_sync", value=last_sync) if self._data else tr("dialogs.main_window.not_connected"))
+        self._set_sync_visual("offline", value=0, text=self._sync_percent_text(0))
         if not self._data:
             if _msg(
                 self,
@@ -1507,9 +1947,44 @@ class MainWindow(QMainWindow):
         headers = info.get("headers", "-")
         peers   = info.get("connections", "-")
 
-        self._set_status_visual("syncing", "  " + tr("dialogs.main_window.synchronizing"))
         self.lbl_blocks.setText(tr("dialogs.main_window.blocks", value=f"{blocks}"))
         self.lbl_peers.setText(tr("dialogs.main_window.peers", value=peers))
+
+        bootstrap_payload = data.get("bootstrap_progress") if isinstance(data, dict) else None
+        if isinstance(bootstrap_payload, dict):
+            try:
+                bar_value = int(bootstrap_payload.get("bar_value", 0) or 0)
+            except Exception:
+                bar_value = 0
+            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.bootstrap_sync"))
+            self._set_sync_visual(
+                "syncing",
+                value=bar_value,
+                text=self._bootstrap_progress_text(
+                    bootstrap_payload,
+                    tr("dialogs.main_window.bootstrap_sync"),
+                ),
+            )
+            return
+
+        progress_payload = data.get("reindex_progress") if isinstance(data, dict) else None
+        if isinstance(progress_payload, dict):
+            try:
+                bar_value = int(progress_payload.get("bar_value", 0) or 0)
+            except Exception:
+                bar_value = 0
+            self._set_status_visual("syncing", "  " + tr("dialogs.main_window.reindex_confirm_title"))
+            self._set_sync_visual(
+                "syncing",
+                value=bar_value,
+                text=self._reindex_progress_text(
+                    progress_payload,
+                    tr("dialogs.main_window.reindexing_block_files"),
+                ),
+            )
+            return
+
+        self._set_status_visual("syncing", "  " + tr("dialogs.main_window.synchronizing"))
 
         vp = chain.get("verificationprogress")
         if vp is not None:
@@ -1521,56 +1996,6 @@ class MainWindow(QMainWindow):
             pct = 0.0
 
         self._set_sync_visual("syncing", value=int(pct * 100), text=tr("dialogs.main_window.synchronization", percent=pct))
-
-    def _run_reconciliation(self, data: dict):
-        if self.cache is None:
-            return
-        try:
-            cached_sum_zat = self.cache.get_total_address_balance_zat(include_hidden=False)
-            total_zat = btcz_to_zat((data.get("total_bal") or {}).get("total", 0))
-            delta = abs(cached_sum_zat - total_zat)
-            self.cache.set_state("last_reconcile_delta_zat", delta)
-            self.cache.set_state("last_reconciled_at", int(time.time()))
-            live_txs = [tx for tx in (data.get("txs") or []) if tx.get("txid")]
-            live_map = {str(tx.get("txid")): tx for tx in live_txs}
-            live_txids = set(live_map)
-            if live_txids:
-                self.cache.clear_transactions_stale(live_txids)
-
-            cached_rows = self.cache.list_transactions(limit=500, newest_first=True)
-            cached_txids = {str(row.get("txid", "")) for row in cached_rows if row.get("txid")}
-
-            for row in cached_rows:
-                txid = str(row.get("txid", "") or "")
-                if not txid or txid not in live_map:
-                    continue
-                live_tx = live_map[txid]
-                live_confirms = int(live_tx.get("confirmations", 0) or 0)
-                live_blockhash = str(live_tx.get("blockhash", "") or "")
-                cached_blockhash = str(row.get("blockhash", "") or "")
-                status = None
-                if live_confirms < 0:
-                    status = "conflicted"
-                elif cached_blockhash and live_blockhash and cached_blockhash != live_blockhash:
-                    status = "reorged"
-                elif live_confirms == 0:
-                    status = "pending"
-                elif live_confirms > 0:
-                    status = "confirmed"
-                if status is not None:
-                    self.cache.update_transaction_reconcile(
-                        txid,
-                        status=status,
-                        confirmations=live_confirms,
-                        blockhash=live_blockhash or None,
-                    )
-
-            if live_txids and data.get("tx_snapshot_complete"):
-                stale_txids = cached_txids - live_txids
-                if stale_txids:
-                    self.cache.mark_transactions_stale(stale_txids)
-        except Exception:
-            pass
 
     def _tx_header_click(self, col: int):
         mapping = {0: "date", 2: "status", 3: "amount"}
@@ -1625,7 +2050,7 @@ class MainWindow(QMainWindow):
         self._rescan_status_active = active
         if active:
             self._set_status_visual("syncing", "  " + tr("dialogs.main_window.wallet_rescan_in_progress"))
-            self._set_sync_visual("syncing", value=0, text=tr("dialogs.main_window.wallet_rescan_in_progress"))
+            self._set_sync_visual("syncing", value=0, text=self._sync_percent_text(0))
         self._update_wallet_key_actions()
 
     def _do_send(self):

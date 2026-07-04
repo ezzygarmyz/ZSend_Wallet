@@ -6,23 +6,31 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from .common import wallet_version
+from .common import cleanup_sensitive_dump_artifacts, wallet_version
 from .rpc import BitcoinZRPC, RPCError
 
-_EXPORT_DUMP_PREFIX = "ZSendWalletExport"
+
+def _clone_rpc(rpc: BitcoinZRPC) -> BitcoinZRPC:
+    clone = getattr(rpc, "clone", None)
+    return clone() if callable(clone) else rpc
+
+
+_EXPORT_DUMP_PREFIX = "zsendexport"
+_LEGACY_EXPORT_DUMP_PREFIX = "ZSendWalletExport"
 _IMPORT_DUMP_PREFIX = "zsend_import_"
 _IMPORT_DUMP_SUFFIX = ".dump"
 
 def _sanitize_dump_basename(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9]", "", value or "")
-    return cleaned[:48] or "ZSendWalletExport"
+    return cleaned[:48] or _EXPORT_DUMP_PREFIX
 
 
-def cleanup_wallet_dump_artifacts(export_dir: Path, data_dir: Path) -> None:
+def cleanup_wallet_dump_artifacts(export_dir: Path, data_dir: Path, secure_dir: Path | None = None) -> None:
     """Remove raw node dump files left by interrupted export/import flows."""
     candidates: list[Path] = []
     try:
         candidates.extend(Path(export_dir).glob(f"{_EXPORT_DUMP_PREFIX}*"))
+        candidates.extend(Path(export_dir).glob(f"{_LEGACY_EXPORT_DUMP_PREFIX}*"))
     except OSError:
         pass
     try:
@@ -36,6 +44,7 @@ def cleanup_wallet_dump_artifacts(export_dir: Path, data_dir: Path) -> None:
                 path.unlink()
         except OSError:
             pass
+    cleanup_sensitive_dump_artifacts(root=secure_dir)
 
 
 def _dump_entry_kind(secret: str, address: str) -> str:
@@ -124,7 +133,7 @@ class FullWalletExportWorker(QThread):
 
     def __init__(self, rpc: BitcoinZRPC, export_dir: Path, dump_basename: str):
         super().__init__()
-        self.rpc = rpc
+        self.rpc = _clone_rpc(rpc)
         self.export_dir = Path(export_dir)
         self.dump_basename = _sanitize_dump_basename(dump_basename)
 
@@ -150,5 +159,3 @@ class FullWalletExportWorker(QThread):
                     dump_file.unlink()
             except Exception:
                 pass
-
-

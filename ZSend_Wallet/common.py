@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import os
+import csv
 import re
 import time
 import socket
@@ -12,6 +13,7 @@ import binascii
 import secrets
 import hashlib
 import traceback
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +73,13 @@ WALLET_DIR = (
 DATA_DIR  = Path(os.environ.get("APPDATA", Path.home())) / "BitcoinZ"
 CONF_PATH = DATA_DIR / "bitcoinz.conf"
 EXPORT_DIR = DATA_DIR / "exports"
+SENSITIVE_TEMP_DIR = Path(tempfile.gettempdir()) / "ZSendWallet" / "secure"
+SENSITIVE_DUMP_PATTERNS = (
+    "zsend_import_*.dump",
+    "zsend_export_*.dump",
+    "zsendexport*",
+    "ZSendWalletExport*",
+)
 
 NODE_CANDIDATES = [
     WALLET_DIR / "bitcoinzd.exe",
@@ -141,6 +150,119 @@ def _mask_secret(value: str) -> str:
     return f"{value[:2]}***{value[-2:]} (len={len(value)})"
 
 
+def _current_user_sid() -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        out = subprocess.check_output(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            stderr=subprocess.DEVNULL,
+            creationflags=_SILENT_FLAGS,
+            timeout=5,
+        ).decode("utf-8", errors="replace")
+        rows = list(csv.reader(io.StringIO(out)))
+        if rows and len(rows[0]) >= 2:
+            return rows[0][1].strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _harden_windows_acl(path: Path) -> bool:
+    if os.name != "nt":
+        return True
+    sid = _current_user_sid()
+    if not sid:
+        return False
+    try:
+        proc = subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{sid}:F", "/c"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_SILENT_FLAGS,
+            timeout=10,
+            check=False,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_sensitive_temp_dir(root: Path | None = None) -> Path:
+    temp_dir = Path(root) if root is not None else SENSITIVE_TEMP_DIR
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        _harden_windows_acl(temp_dir)
+    else:
+        try:
+            os.chmod(temp_dir, 0o700)
+        except OSError:
+            pass
+    return temp_dir
+
+
+def create_sensitive_text_file(prefix: str, suffix: str, text: str, *, root: Path | None = None) -> Path:
+    temp_dir = ensure_sensitive_temp_dir(root)
+    for _ in range(16):
+        path = temp_dir / f"{prefix}{secrets.token_hex(16)}{suffix}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(str(path), flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            if os.name == "nt":
+                _harden_windows_acl(path)
+            else:
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+            return path
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            raise
+    raise FileExistsError("Could not create a unique sensitive temporary file")
+
+
+def cleanup_sensitive_dump_artifacts(*, root: Path | None = None, extra_dirs: list[Path] | tuple[Path, ...] | None = None) -> None:
+    dirs: list[Path] = [Path(root) if root is not None else SENSITIVE_TEMP_DIR]
+    dirs.extend(Path(folder) for folder in (extra_dirs or ()))
+    seen: set[Path] = set()
+    for folder in dirs:
+        try:
+            folder = folder.resolve()
+        except OSError:
+            folder = Path(folder)
+        if folder in seen or not folder.exists() or not folder.is_dir():
+            continue
+        seen.add(folder)
+        for pattern in SENSITIVE_DUMP_PATTERNS:
+            try:
+                matches = list(folder.glob(pattern))
+            except OSError:
+                continue
+            for path in matches:
+                try:
+                    if path.is_file():
+                        path.unlink()
+                except OSError:
+                    pass
+
+
+def _norm_conf_path(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expandvars(os.path.expanduser(str(path)))))
+
+
 def _track(worker: "QThread") -> "QThread":
     _RUNNING_WORKERS.add(worker)
     worker.finished.connect(lambda: _RUNNING_WORKERS.discard(worker))
@@ -189,6 +311,49 @@ def read_conf_values(path: Path, key_name: str) -> list[str]:
     except OSError:
         pass
     return values
+
+
+def set_conf_value(path: Path, key_name: str, value: str) -> bool:
+    wanted = str(key_name or "").strip().lower()
+    if not wanted or not path.exists():
+        return False
+
+    desired = f"{key_name}={value}"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+
+    seen = False
+    changed = False
+    cleaned: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            cleaned.append(line)
+            continue
+        key, _, current_value = stripped.partition("=")
+        if key.strip().lower() != wanted:
+            cleaned.append(line)
+            continue
+        if seen:
+            changed = True
+            continue
+        seen = True
+        if current_value.strip() == str(value):
+            cleaned.append(line)
+        else:
+            cleaned.append(desired)
+            changed = True
+
+    if not changed:
+        return False
+
+    try:
+        path.write_text("\n".join(cleaned).rstrip() + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def append_conf_lines(path: Path, lines: list[str]) -> None:
@@ -250,17 +415,17 @@ def normalize_addnode_spacing(path: Path) -> None:
 def ensure_conf(path: Path = CONF_PATH) -> dict:
     debug_log("ensure_conf called", path=str(path), exists=path.exists())
     path.parent.mkdir(parents=True, exist_ok=True)
-    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     existing = read_conf(path)
 
     if not path.exists():
         rpcuser = _b58(16)
         rpcpassword = _b58(32)
+        export_dir = ensure_sensitive_temp_dir()
         lines = [
             f"rpcuser={rpcuser}",
             f"rpcpassword={rpcpassword}",
             "sendchangeback=1",
-            f"exportdir={EXPORT_DIR.as_posix()}",
+            f"exportdir={export_dir.as_posix()}",
         ]
         for node in _ADDNODES:
             lines.append(f"addnode={node}")
@@ -275,12 +440,14 @@ def ensure_conf(path: Path = CONF_PATH) -> dict:
             to_add.append(f"rpcuser={_b58(16)}")
         if not existing.get("rpcpassword"):
             to_add.append(f"rpcpassword={_b58(32)}")
+        if not existing.get("sendchangeback"):
+            to_add.append("sendchangeback=1")
+        elif existing.get("sendchangeback") != "1":
+            set_conf_value(path, "sendchangeback", "1")
         existing_addnodes = {node.lower() for node in read_conf_values(path, "addnode")}
         for node in _ADDNODES:
             if node.lower() not in existing_addnodes:
                 to_add.append(f"addnode={node}")
-        if not existing.get("exportdir"):
-            to_add.append(f"exportdir={EXPORT_DIR.as_posix()}")
         if to_add:
             try:
                 append_conf_lines(path, to_add)
@@ -294,27 +461,26 @@ def ensure_conf(path: Path = CONF_PATH) -> dict:
         path=str(path),
         rpcuser=_mask_secret(cfg.get("rpcuser", "")),
         rpcpassword=_mask_secret(cfg.get("rpcpassword", "")),
-        exportdir=cfg.get("exportdir", ""),
+        exportdir_configured=bool(cfg.get("exportdir", "")),
         keys=sorted(cfg.keys()),
     )
     return cfg
 
 
-def ensure_exportdir(path: Path = CONF_PATH) -> tuple[Path, bool]:
+def ensure_exportdir(path: Path = CONF_PATH, secure_dir: Path | None = None) -> tuple[Path, bool]:
     cfg = ensure_conf(path)
+    export_path = ensure_sensitive_temp_dir(secure_dir)
     export_val = cfg.get("exportdir", "").strip()
     changed = False
-    if export_val:
-        export_path = Path(export_val)
-    else:
-        export_path = EXPORT_DIR
+    if not export_val:
         changed = True
         try:
             append_conf_lines(path, [f"exportdir={export_path.as_posix()}"])
         except OSError:
             pass
-    export_path.mkdir(parents=True, exist_ok=True)
-    debug_log("ensure_exportdir finished", export_path=str(export_path), changed=changed)
+    elif _norm_conf_path(export_val) != _norm_conf_path(export_path):
+        changed = set_conf_value(path, "exportdir", export_path.as_posix()) or changed
+    debug_log("ensure_exportdir finished", exportdir_secure=True, changed=changed)
     return export_path, changed
 
 
@@ -325,7 +491,7 @@ def load_rpc_cfg() -> dict:
         "port":       int(c.get("rpcport", _RPC_DEFAULT_PORT)),
         "user":       c.get("rpcuser",     ""),
         "password":   c.get("rpcpassword", ""),
-        "exportdir":  c.get("exportdir", EXPORT_DIR.as_posix()),
+        "exportdir":  c.get("exportdir", ""),
         "conf_path":  str(CONF_PATH),
         "conf_found": CONF_PATH.exists(),
     }
@@ -357,10 +523,14 @@ def node_running() -> bool:
         return False
 
 
-def launch_node(binary: Path):
+def launch_node(binary: Path, extra_args: list[str] | tuple[str, ...] | None = None):
     try:
         export_dir, _ = ensure_exportdir()
         args = [str(binary), f"-conf={CONF_PATH}", f"-exportdir={export_dir}"]
+        for arg in extra_args or ():
+            arg = str(arg or "").strip()
+            if arg:
+                args.append(arg)
         debug_log("Launching node process", args=args)
         proc = subprocess.Popen(
             args,
@@ -406,7 +576,7 @@ def tx_fingerprint(txs: list) -> str:
 
 def _sanitize_dump_basename(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9]", "", value or "")
-    return cleaned[:48] or "ZSendWalletExport"
+    return cleaned[:48] or "zsendexport"
 
 
 def _representative_tx_address(entries: list[dict]) -> str:

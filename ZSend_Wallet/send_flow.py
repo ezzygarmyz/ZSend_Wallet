@@ -283,7 +283,6 @@ def cache_upsert_send_operation(window, opid: str, status: str) -> None:
             to_address=ctx.get("to"),
             amount=ctx.get("amount"),
             fee=ctx.get("fee"),
-            memo=ctx.get("memo"),
         )
     except Exception:
         pass
@@ -309,11 +308,16 @@ def send_ok(window, opid: str) -> None:
     pw.status_update.connect(lambda status: poll_status(window, status))
     pw.success.connect(lambda txid: poll_success(window, txid))
     pw.failed.connect(lambda msg: poll_failed(window, msg))
+    pw.cancelled.connect(lambda msg: poll_cancelled(window, msg))
+    pw.unknown.connect(lambda msg: poll_unknown(window, msg))
     _track(pw).start()
 
 
 def poll_status(window, status: str) -> None:
-    cache_update_send_operation(window, "executing", result={"status": status})
+    node_status = str(status or "").strip().lower()
+    if node_status not in {"queued", "executing"}:
+        node_status = "executing"
+    cache_update_send_operation(window, node_status)
 
 
 def poll_success(window, txid: str) -> None:
@@ -330,7 +334,29 @@ def poll_failed(window, msg: str) -> None:
     window._active_opid = ""
     window._pending_send = None
     window._update_send_btn()
+    window.refresh(force_full=True)
     _msg_critical(window, tr("dialogs.send_flow.send_error"), msg)
+
+
+def poll_cancelled(window, msg: str) -> None:
+    cache_update_send_operation(window, "cancelled", error=msg)
+    window._active_opid = ""
+    window._pending_send = None
+    window._update_send_btn()
+    window.refresh(force_full=True)
+
+
+def poll_unknown(window, msg: str) -> None:
+    cache_update_send_operation(window, "unknown", error=msg)
+    window._active_opid = ""
+    window._pending_send = None
+    window._update_send_btn()
+    window.refresh(force_full=True)
+    _msg_warning(
+        window,
+        tr("dialogs.send_flow.operation_unknown_title"),
+        tr("dialogs.send_flow.operation_unknown_note"),
+    )
 
 
 def send_err(window, msg: str) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import re
 import shutil
@@ -9,6 +10,7 @@ import sys
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
+from importlib import metadata as importlib_metadata
 from importlib import util as importlib_util
 from pathlib import Path
 
@@ -37,18 +39,34 @@ LICENSE_DIR = PROJECT_ROOT / "license"
 VERSION_INFO_PATH = PROJECT_ROOT / "_pyi_version_info.txt"
 BUILD_MARKER_PATH = PROJECT_ROOT / "_zsend_build_mode.json"
 LOCALES_DIR = PROJECT_ROOT / "ZSend_Wallet" / "locales"
+BUILD_DEPS_DIR = PROJECT_ROOT / "tools" / "build_deps"
 APP_NAME = "ZSend_Wallet"
 DEBUG_APP_NAME = f"{APP_NAME}_debug"
 BITCOINZ_RELEASE_API = "https://api.github.com/repos/btcz/bitcoinz/releases/latest"
 NODE_BINARIES = ("bitcoinzd.exe", "bitcoinz-cli.exe", "bitcoinz-tx.exe")
 BUILD_REQUIREMENTS = (
-    ("PyInstaller", "PyInstaller"),
-    ("PySide6", "PySide6"),
-    ("requests", "requests"),
-    ("qrcode", "qrcode[pil]"),
-    ("PIL", "Pillow"),
+    ("PyInstaller", "PyInstaller", "PyInstaller", "6.14.2"),
+    ("PySide6", "PySide6", "PySide6", "6.9.1"),
+    ("requests", "requests", "requests", "2.32.4"),
+    ("qrcode", "qrcode", "qrcode[pil]", "8.2"),
+    ("PIL", "Pillow", "Pillow", "11.3.0"),
 )
+TEST_REQUIREMENTS = (
+    ("pytest", "pytest", "pytest", "9.0.3"),
+)
+DEV_REQUIREMENTS = TEST_REQUIREMENTS + BUILD_REQUIREMENTS
 PYINSTALLER_EXCLUDES = ("numpy", "pygame")
+
+
+def _prepend_build_deps_path() -> None:
+    if not BUILD_DEPS_DIR.exists():
+        return
+    deps_path = str(BUILD_DEPS_DIR)
+    if deps_path not in sys.path:
+        sys.path.insert(0, deps_path)
+
+
+_prepend_build_deps_path()
 
 
 def _build_identity(debug: bool) -> dict[str, str]:
@@ -92,20 +110,100 @@ def _remove_pycache_dirs(root: Path) -> None:
 
 def _run(cmd: list[str], *, cwd: Path | None = None) -> None:
     print(" ".join(f'"{part}"' if " " in part else part for part in cmd))
-    subprocess.run(cmd, cwd=cwd or PROJECT_ROOT, check=True)
+    env = os.environ.copy()
+    if BUILD_DEPS_DIR.exists():
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        paths = [str(BUILD_DEPS_DIR)]
+        if existing_pythonpath:
+            paths.append(existing_pythonpath)
+        env["PYTHONPATH"] = os.pathsep.join(paths)
+    subprocess.run(cmd, cwd=cwd or PROJECT_ROOT, check=True, env=env)
 
 
-def _ensure_build_requirements() -> None:
-    missing: list[str] = []
-    for module_name, package_name in BUILD_REQUIREMENTS:
+def _build_requirement_spec(requirement: tuple[str, str, str, str]) -> str:
+    _module_name, _distribution_name, install_name, version = requirement
+    return f"{install_name}=={version}"
+
+
+def requirement_specs(requirements: tuple[tuple[str, str, str, str], ...]) -> list[str]:
+    return [_build_requirement_spec(requirement) for requirement in requirements]
+
+
+def dev_requirement_specs() -> list[str]:
+    return requirement_specs(DEV_REQUIREMENTS)
+
+
+def _distribution_version_from_build_deps(distribution_name: str) -> str | None:
+    if not BUILD_DEPS_DIR.exists():
+        return None
+    try:
+        distributions = importlib_metadata.distributions(path=[str(BUILD_DEPS_DIR)])
+        for distribution in distributions:
+            if distribution.metadata["Name"].lower().replace("_", "-") == distribution_name.lower().replace("_", "-"):
+                return distribution.version
+    except Exception:
+        return None
+    return None
+
+
+def _find_unsatisfied_requirements(
+    requirements: tuple[tuple[str, str, str, str], ...],
+) -> list[tuple[str, str]]:
+    unsatisfied: list[tuple[str, str]] = []
+    _prepend_build_deps_path()
+    for module_name, distribution_name, install_name, expected_version in requirements:
+        spec = f"{install_name}=={expected_version}"
         if importlib_util.find_spec(module_name) is None:
-            missing.append(package_name)
-    if not missing:
+            unsatisfied.append((spec, "missing"))
+            continue
+        actual_version = _distribution_version_from_build_deps(distribution_name)
+        if actual_version is None:
+            try:
+                actual_version = importlib_metadata.version(distribution_name)
+            except importlib_metadata.PackageNotFoundError:
+                actual_version = "unknown"
+        if actual_version != expected_version:
+            unsatisfied.append((spec, f"installed {actual_version}"))
+    return unsatisfied
+
+
+def _find_unsatisfied_build_requirements() -> list[tuple[str, str]]:
+    return _find_unsatisfied_requirements(BUILD_REQUIREMENTS)
+
+
+def _ensure_build_requirements(*, install: bool = False) -> None:
+    unsatisfied = _find_unsatisfied_build_requirements()
+    if not unsatisfied:
         return
-    print("Installing missing build dependencies:")
-    for package_name in missing:
-        print(f"  - {package_name}")
-    _run([sys.executable, "-m", "pip", "install", "--upgrade", *missing])
+
+    exact_specs = [spec for spec, _reason in unsatisfied]
+    if install:
+        _remove_path(BUILD_DEPS_DIR)
+        BUILD_DEPS_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Installing exact build dependencies into {BUILD_DEPS_DIR}:")
+        for spec, reason in unsatisfied:
+            print(f"  - {spec} ({reason})")
+        _run([
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--target",
+            str(BUILD_DEPS_DIR),
+            *exact_specs,
+        ])
+        _prepend_build_deps_path()
+        return
+
+    details = "\n".join(f"  - {spec} ({reason})" for spec, reason in unsatisfied)
+    install_cmd = " ".join([sys.executable, str(Path(__file__).name), "--install-build-deps"])
+    raise RuntimeError(
+        "Build dependencies are missing or not pinned to the expected versions:\n"
+        f"{details}\n\n"
+        "Install the exact local build dependencies first:\n"
+        f"{install_cmd}\n\n"
+        f"Dependencies will be installed into {BUILD_DEPS_DIR}, not into global Python."
+    )
 
 
 def _check_inputs() -> None:
@@ -240,48 +338,50 @@ def prepare_node() -> dict[str, object]:
     _remove_path(node_tmp)
     node_tmp.mkdir(parents=True, exist_ok=True)
 
-    print("Checking latest BitcoinZ node release...")
-    release = _download_json(BITCOINZ_RELEASE_API)
-    asset = _find_windows_node_asset(release)
-    asset_name = str(asset["name"])
-    download_url = str(asset["browser_download_url"])
-    zip_path = node_tmp / asset_name
-
-    print(f"Downloading BitcoinZ node: {asset_name}")
-    _download_file(download_url, zip_path)
-    print("Extracting node binaries...")
-    _extract_node_binaries(zip_path, NODE_DIR)
-
-    metadata = {
-        "release_name": str(release.get("name") or ""),
-        "tag_name": str(release.get("tag_name") or ""),
-        "asset_name": asset_name,
-        "download_url": download_url,
-        "downloaded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "included_files": list(NODE_BINARIES),
-    }
-    (NODE_DIR / "bitcoinz_node_release.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    _remove_path(node_tmp)
-    return metadata
-
-
-def _read_existing_node_metadata() -> dict[str, object] | None:
-    metadata_path = NODE_DIR / "bitcoinz_node_release.json"
-    if not metadata_path.exists():
-        return None
     try:
-        return json.loads(metadata_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+        print("Checking latest BitcoinZ node release...")
+        release = _download_json(BITCOINZ_RELEASE_API)
+        asset = _find_windows_node_asset(release)
+        asset_name = str(asset["name"])
+        download_url = str(asset["browser_download_url"])
+        zip_path = node_tmp / asset_name
+
+        print(f"Downloading BitcoinZ node: {asset_name}")
+        _download_file(download_url, zip_path)
+        print("Extracting node binaries...")
+        _extract_node_binaries(zip_path, NODE_DIR)
+
+        return {
+            "release_name": str(release.get("name") or ""),
+            "tag_name": str(release.get("tag_name") or ""),
+            "asset_name": asset_name,
+            "download_url": download_url,
+            "downloaded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "included_files": list(NODE_BINARIES),
+        }
+    finally:
+        _remove_path(node_tmp)
 
 
 def _copy_tree(src: Path, dst: Path) -> None:
     if not src.exists():
         raise FileNotFoundError(f"Required release input not found: {src}")
     shutil.copytree(src, dst)
+
+
+def _copy_node_binaries(src: Path, dst: Path) -> None:
+    if not src.exists():
+        raise FileNotFoundError(f"Required release input not found: {src}")
+    dst.mkdir(parents=True, exist_ok=True)
+    missing: list[str] = []
+    for filename in NODE_BINARIES:
+        source_file = src / filename
+        if not source_file.exists():
+            missing.append(filename)
+            continue
+        shutil.copy2(source_file, dst / filename)
+    if missing:
+        raise FileNotFoundError("Missing required node binary file(s): " + ", ".join(missing))
 
 
 def _zip_dir(src_dir: Path, zip_path: Path) -> None:
@@ -296,7 +396,7 @@ def _safe_version_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "unknown"
 
 
-def package_release(exe_path: Path, identity: dict[str, str], _node_metadata: dict[str, object] | None) -> Path:
+def package_release(exe_path: Path, identity: dict[str, str]) -> Path:
     mode_suffix = "_debug" if identity["app_name"] == DEBUG_APP_NAME else ""
     package_name = f"ZSend_Wallet_{_safe_version_name(DISPLAY_VERSION)}{mode_suffix}"
     package_root = RELEASE_DIR / package_name
@@ -304,7 +404,7 @@ def package_release(exe_path: Path, identity: dict[str, str], _node_metadata: di
     package_root.mkdir(parents=True, exist_ok=True)
 
     shutil.copy2(exe_path, package_root / exe_path.name)
-    _copy_tree(NODE_DIR, package_root / "node")
+    _copy_node_binaries(NODE_DIR, package_root / "node")
     _copy_tree(LICENSE_DIR, package_root / "license")
 
     RELEASE_DIR.mkdir(exist_ok=True)
@@ -313,8 +413,13 @@ def package_release(exe_path: Path, identity: dict[str, str], _node_metadata: di
     return zip_path
 
 
-def build(debug: bool = False, skip_node: bool = False, skip_package: bool = False) -> int:
-    _ensure_build_requirements()
+def build(
+    debug: bool = False,
+    skip_node: bool = False,
+    skip_package: bool = False,
+    install_build_deps: bool = False,
+) -> int:
+    _ensure_build_requirements(install=install_build_deps)
     _check_inputs()
     identity = _build_identity(debug)
     final_exe_path = PROJECT_ROOT / identity["original_filename"]
@@ -337,11 +442,8 @@ def build(debug: bool = False, skip_node: bool = False, skip_package: bool = Fal
     if debug:
         _write_build_marker(BUILD_MARKER_PATH, identity)
 
-    node_metadata = None
     if not skip_node:
-        node_metadata = prepare_node()
-    else:
-        node_metadata = _read_existing_node_metadata()
+        prepare_node()
 
     cmd = [
         sys.executable,
@@ -402,7 +504,7 @@ def build(debug: bool = False, skip_node: bool = False, skip_package: bool = Fal
 
     print(f"\nBuild complete:\n{final_exe_path}")
     if not skip_package:
-        zip_path = package_release(final_exe_path, identity, node_metadata)
+        zip_path = package_release(final_exe_path, identity)
         print(f"Release package:\n{zip_path}")
     return 0
 
@@ -424,13 +526,25 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Build only the executable and skip release zip packaging.",
     )
+    parser.add_argument(
+        "--install-build-deps",
+        action="store_true",
+        help="Install exact pinned build dependencies before building.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     try:
         args = _parse_args()
-        raise SystemExit(build(debug=args.debug, skip_node=args.skip_node, skip_package=args.skip_package))
+        raise SystemExit(
+            build(
+                debug=args.debug,
+                skip_node=args.skip_node,
+                skip_package=args.skip_package,
+                install_build_deps=args.install_build_deps,
+            )
+        )
     except Exception as exc:
         print(f"Build failed:\n{exc}", file=sys.stderr)
         raise SystemExit(1)
