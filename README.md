@@ -15,7 +15,11 @@
 - Install dependencies:
 
   ```
-  pip install PySide6 requests qrcode[pil] Pillow
+  PyInstaller==6.14.2
+  PySide6==6.9.1
+  requests==2.32.4
+  qrcode[pil]==8.2
+  Pillow==11.3.0
   ```
 
 ## ⚙️ Node
