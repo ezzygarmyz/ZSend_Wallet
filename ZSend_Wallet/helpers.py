@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from PySide6.QtWidgets import QLabel, QPushButton
+
+
+_PLATFORMS = {
+    "darwin": "macOS",
+    "linux": "linux",
+    "freebsd": "freeBSD",
+    "win32": "windows",
+}
+
+def get_current_platform() -> str | None:
+    return _PLATFORMS.get(sys.platform)
+
+current_platform = get_current_platform()
 
 
 _BTCZ_DISPLAY_QUANT = Decimal("0.00000001")

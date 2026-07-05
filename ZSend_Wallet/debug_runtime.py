@@ -10,10 +10,16 @@ import threading
 import traceback
 from pathlib import Path
 
+from .helpers import current_platform
+
 from PySide6.QtCore import qInstallMessageHandler
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
-_DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "BitcoinZ"
+if current_platform == "windows":
+    _DATA_DIR  = Path(os.environ.get("APPDATA", Path.home())) / "BitcoinZ"
+elif current_platform == "linux":
+    _DATA_DIR  = Path.home() / ".bitcoinz"
+
 _DEBUG_LOG_PATH = _DATA_DIR / "zsend_debug.log"
 _BUILD_MARKER_NAME = "_zsend_build_mode.json"
 
