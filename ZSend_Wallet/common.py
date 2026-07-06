@@ -32,7 +32,7 @@ except Exception:
 
 from .version import DISPLAY_VERSION
 from .wallet_cache import WalletCache, btcz_to_zat, zat_to_float
-from .helpers import fmt_btcz, is_shielded_address
+from .helpers import fmt_btcz, is_shielded_address, current_platform
 
 wallet_version = DISPLAY_VERSION
 DEVELOPER_TIP_ADDRESS = "t1fjtqgoCboGToe6Mv68n5AvdDZaL6ZSend"
@@ -63,6 +63,14 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from .debug_runtime import debug_exception, debug_log
 
+if current_platform == "windows":
+    DATA_DIR  = Path(os.environ.get("APPDATA", Path.home())) / "BitcoinZ"
+    PARAMS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "ZcashParams"
+elif current_platform == "linux":
+    DATA_DIR  = Path.home() / ".bitcoinz"
+    PARAMS_DIR = Path.home() / ".zcash-params"
+
+NODE_EXECUTABLE = "bitcoinzd.exe" if current_platform == "windows" else "bitcoinzd"
 
 WALLET_DIR = (
     Path(sys.executable).parent
@@ -70,7 +78,6 @@ WALLET_DIR = (
     else Path(__file__).resolve().parent.parent
 )
 
-DATA_DIR  = Path(os.environ.get("APPDATA", Path.home())) / "BitcoinZ"
 CONF_PATH = DATA_DIR / "bitcoinz.conf"
 EXPORT_DIR = DATA_DIR / "exports"
 SENSITIVE_TEMP_DIR = Path(tempfile.gettempdir()) / "ZSendWallet" / "secure"
@@ -82,12 +89,10 @@ SENSITIVE_DUMP_PATTERNS = (
 )
 
 NODE_CANDIDATES = [
-    WALLET_DIR / "bitcoinzd.exe",
-    WALLET_DIR / "node" / "bitcoinzd.exe",
-    WALLET_DIR / "bitcoinz" / "bitcoinzd.exe",
+    WALLET_DIR / NODE_EXECUTABLE,
+    WALLET_DIR / "node" / NODE_EXECUTABLE,
+    WALLET_DIR / "bitcoinz" / NODE_EXECUTABLE,
 ]
-
-PARAMS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "ZcashParams"
 
 PARAMS_FILES = [
     {

@@ -1,0 +1,11 @@
+
+/env
+/ZSend_Wallet/__pycache__
+/dist
+/tmp
+/node
+/tools
+/release
+*.exe
+*.txt
+*.spec

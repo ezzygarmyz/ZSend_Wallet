@@ -5,6 +5,9 @@ import os
 import json
 import re
 import shutil
+import stat
+import tarfile
+import platform
 import subprocess
 import sys
 import urllib.request
@@ -14,6 +17,7 @@ from importlib import metadata as importlib_metadata
 from importlib import util as importlib_util
 from pathlib import Path
 
+from ZSend_Wallet.helpers import current_platform
 from ZSend_Wallet.version import (
     COMMENTS,
     COMPANY_NAME,
@@ -35,7 +39,7 @@ BUILD_DIR = PROJECT_ROOT / "build"
 TMP_DIR = PROJECT_ROOT / "tmp"
 RELEASE_DIR = PROJECT_ROOT / "release"
 NODE_DIR = PROJECT_ROOT / "node"
-LICENSE_DIR = PROJECT_ROOT / "license"
+LICENSE_DIR = PROJECT_ROOT / "LICENSE"
 VERSION_INFO_PATH = PROJECT_ROOT / "_pyi_version_info.txt"
 BUILD_MARKER_PATH = PROJECT_ROOT / "_zsend_build_mode.json"
 LOCALES_DIR = PROJECT_ROOT / "ZSend_Wallet" / "locales"
@@ -43,7 +47,11 @@ BUILD_DEPS_DIR = PROJECT_ROOT / "tools" / "build_deps"
 APP_NAME = "ZSend_Wallet"
 DEBUG_APP_NAME = f"{APP_NAME}_debug"
 BITCOINZ_RELEASE_API = "https://api.github.com/repos/btcz/bitcoinz/releases/latest"
-NODE_BINARIES = ("bitcoinzd.exe", "bitcoinz-cli.exe", "bitcoinz-tx.exe")
+NODE_BINARIES = (
+    ("bitcoinzd.exe", "bitcoinz-cli.exe", "bitcoinz-tx.exe")
+    if current_platform == "windows"
+    else ("bitcoinzd", "bitcoinz-cli", "bitcoinz-tx")
+)
 BUILD_REQUIREMENTS = (
     ("PyInstaller", "PyInstaller", "PyInstaller", "6.14.2"),
     ("PySide6", "PySide6", "PySide6", "6.9.1"),
@@ -297,17 +305,31 @@ def _download_file(url: str, destination: Path) -> None:
         shutil.copyfileobj(response, out, length=1024 * 1024)
 
 
-def _find_windows_node_asset(release: dict) -> dict:
+def _find_node_asset(release: dict) -> dict:
     assets = release.get("assets") or []
     candidates = []
+    machine = platform.machine().lower()
     for asset in assets:
-        name = str(asset.get("name") or "")
-        lower = name.lower()
-        if lower.endswith(".zip") and "win64" in lower and "bitcoinz" in lower:
-            candidates.append(asset)
+        name = str(asset.get("name") or "").lower()
+        
+        if current_platform == "windows":
+            if name.endswith(".zip") and "win64" in name and "bitcoinz" in name:
+                candidates.append(asset)
+
+        elif current_platform == "linux":
+            is_linux_archive = name.endswith(".tar.gz") or name.endswith(".tar.xz")
+            is_x86_64 = machine in ("x86_64", "amd64") and "x86_64" in name and "gnu" in name
+            is_aarch64 = machine in ("aarch64", "arm64") and (
+                "aarch64" in name or "arm64" in name
+            ) and "gnu" in name
+            if is_linux_archive and "bitcoinz" in name and (is_x86_64 or is_aarch64):
+                candidates.append(asset)
+
     if not candidates:
         available = "\n".join(str(asset.get("name") or "") for asset in assets) or "(no assets)"
-        raise RuntimeError("Could not find BitcoinZ win64 zip asset. Available assets:\n" + available)
+        raise RuntimeError(
+            f"No BitcoinZ asset found for platform={current_platform}\n{available}"
+        )
     candidates.sort(key=lambda asset: str(asset.get("name") or ""))
     return candidates[0]
 
@@ -316,17 +338,44 @@ def _extract_node_binaries(zip_path: Path, destination: Path) -> None:
     _remove_path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     found: set[str] = set()
-    with zipfile.ZipFile(zip_path) as archive:
-        for member in archive.infolist():
-            if member.is_dir():
-                continue
-            filename = Path(member.filename).name
-            if filename not in NODE_BINARIES:
-                continue
-            target = destination / filename
-            with archive.open(member) as src, target.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
-            found.add(filename)
+    suffix = "".join(zip_path.suffixes)
+
+    def _make_executable(path: Path) -> None:
+        if os.name != "nt":
+            mode = path.stat().st_mode
+            path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    if suffix.endswith(".zip"):
+        with zipfile.ZipFile(zip_path) as archive:
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+                filename = Path(member.filename).name
+                if filename not in NODE_BINARIES:
+                    continue
+                target = destination / filename
+                with archive.open(member) as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+                found.add(filename)
+
+    else:
+        with tarfile.open(zip_path, "r:*") as archive:
+            for member in archive.getmembers():
+                if not member.isfile():
+                    continue
+                filename = Path(member.name).name
+                if filename not in NODE_BINARIES:
+                    continue
+                target = destination / filename
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                with extracted as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                _make_executable(target)
+
+                found.add(filename)
     missing = [filename for filename in NODE_BINARIES if filename not in found]
     if missing:
         raise RuntimeError(f"BitcoinZ node archive is missing required file(s): {', '.join(missing)}")
@@ -341,7 +390,7 @@ def prepare_node() -> dict[str, object]:
     try:
         print("Checking latest BitcoinZ node release...")
         release = _download_json(BITCOINZ_RELEASE_API)
-        asset = _find_windows_node_asset(release)
+        asset = _find_node_asset(release)
         asset_name = str(asset["name"])
         download_url = str(asset["browser_download_url"])
         zip_path = node_tmp / asset_name
@@ -462,9 +511,9 @@ def build(
         "--version-file",
         str(VERSION_INFO_PATH),
         "--add-data",
-        f"{ICON_PATH};icons",
+        f"{ICON_PATH}:icons",
         "--add-data",
-        f"{LOCALES_DIR};locales",
+        f"{LOCALES_DIR}:locales",
         "--paths",
         str(PROJECT_ROOT),
         "--hidden-import",
