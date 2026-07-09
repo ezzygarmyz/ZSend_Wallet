@@ -7,13 +7,19 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable
 
+from .helpers import current_platform
+
 
 SCHEMA_VERSION = 4
 BTCZ_ZAT = Decimal("100000000")
 
 
 def default_cache_path() -> Path:
-    data_dir = Path(os.environ.get("APPDATA", Path.home())) / "BitcoinZ"
+    if current_platform == "windows":
+        data_dir  = Path(os.environ.get("APPDATA", Path.home())) / "BitcoinZ"
+    elif current_platform == "linux":
+        data_dir  = Path.home() / ".bitcoinz"
+
     return data_dir / "zsend_cache.sqlite"
 
 
