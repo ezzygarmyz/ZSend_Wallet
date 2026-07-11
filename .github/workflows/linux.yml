@@ -1,0 +1,48 @@
+
+name: ZSend Wallet (linux)
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_COLOR: "1"
+
+jobs:
+  linux-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    name: Linux (Python ${{ matrix.python-version }})
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create virtual environment
+        run: |
+          python -m venv env
+          source env/bin/activate
+          python -m pip install --upgrade pip
+
+      
+      - name: Install build dependencies
+        run: |
+          source env/bin/activate
+          python build_wallet.py --install-build-deps
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZSend-Wallet-linux-py${{ matrix.python-version }}
+          path: dist/**
+          if-no-files-found: error
