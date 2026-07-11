@@ -457,7 +457,8 @@ def package_release(exe_path: Path, identity: dict[str, str]) -> Path:
     _copy_tree(LICENSE_DIR, package_root / "license")
 
     RELEASE_DIR.mkdir(exist_ok=True)
-    zip_path = RELEASE_DIR / f"{package_name}-win.zip"
+    suffix = "win" if current_platform == "windows" else "linux"
+    zip_path = RELEASE_DIR / f"{package_name}-{suffix}.zip"
     _zip_dir(package_root, zip_path)
     return zip_path
 
@@ -527,7 +528,7 @@ def build(
     if debug:
         cmd.extend([
             "--add-data",
-            f"{BUILD_MARKER_PATH};.",
+            f"{BUILD_MARKER_PATH}:.",
         ])
 
     mode_name = "debug" if debug else "release"
