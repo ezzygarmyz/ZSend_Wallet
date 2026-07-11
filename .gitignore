@@ -7,5 +7,4 @@
 /tools
 /release
 *.exe
-*.txt
 *.spec

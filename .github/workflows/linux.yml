@@ -34,6 +34,11 @@ jobs:
           source env/bin/activate
           python -m pip install --upgrade pip
 
+      - name: Install Python dependencies
+        run: |
+          source env/bin/activate
+          python -m pip install -r requirements.txt
+
       
       - name: Install build dependencies
         run: |
